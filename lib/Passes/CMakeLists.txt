@@ -1,9 +1,8 @@
 add_mlir_library(MLIRNeptuneIRTransforms
-    VerifyAndAnnotate.cpp
-    StructureLowering.cpp
-    RuntimeLowering.cpp
-    DataflowLowering.cpp
-    HighLevelConvertion.cpp
+    NeptuneIRVerifyForms.cpp
+    NeptuneIRNormalizeApply.cpp
+    NeptuneIRSplitDomain.cpp
+    NeptuneIREmitCHalide.cpp
     DEPENDS MLIRNeptuneIRTransformsIncGen
 
     LINK_LIBS MLIRIR

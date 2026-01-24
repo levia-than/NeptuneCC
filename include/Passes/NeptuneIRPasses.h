@@ -9,23 +9,13 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassRegistry.h"
 #include "Dialect/NeptuneIR/NeptuneIRAttrs.h"
+#include "mlir/Dialect/EmitC/IR/EmitC.h"
+#include "Dialect/NeptuneIR/NeptuneIRDialect.h"
 #include "Dialect/NeptuneIR/NeptuneIROps.h"
 #include <memory>
 
 namespace mlir::Neptune::NeptuneIR {
     
-enum class DataflowBackend {
-  cpu,
-  gpu,
-};
-
-enum class RuntimeKind {
-  petsc,
-  cuda,
-  hip,
-  native,
-};
-
 #define GEN_PASS_DECL
 #include "Passes/NeptuneIRPasses.h.inc"
 

@@ -3,7 +3,6 @@ project(NeptuneSolver LANGUAGES CXX C)
 
 list(PREPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/Modules")
 
-# Always build the Python _neptune_mlir extension so the MLIR backend is available.
 set(NEPTUNE_ENABLE_PETSC OFF CACHE BOOL "Enable PETSc-based solver integration")
 
 if(POLICY CMP0148)
@@ -17,8 +16,20 @@ endif()
 enable_testing()
 
 find_package(LLVM REQUIRED CONFIG)
+
+# Prefer Clang/MLIR from the same LLVM prefix to avoid mixed installations.
+if(DEFINED LLVM_CMAKE_DIR)
+  get_filename_component(_llvm_cmake_root "${LLVM_CMAKE_DIR}" DIRECTORY)
+  if(NOT Clang_DIR AND EXISTS "${_llvm_cmake_root}/clang/ClangConfig.cmake")
+    set(Clang_DIR "${_llvm_cmake_root}/clang")
+  endif()
+  if(NOT MLIR_DIR AND EXISTS "${_llvm_cmake_root}/mlir/MLIRConfig.cmake")
+    set(MLIR_DIR "${_llvm_cmake_root}/mlir")
+  endif()
+endif()
+
+find_package(Clang REQUIRED CONFIG)
 find_package(MLIR REQUIRED CONFIG)
-find_package(pybind11 REQUIRED)
 
 if(NEPTUNE_ENABLE_PETSC)
   find_package(PETSc REQUIRED)
@@ -60,8 +71,7 @@ add_definitions(${LLVM_DEFINITIONS})
 # 6. 添加自定义源码（Dialect/Pass）
 add_subdirectory(include)
 add_subdirectory(lib)
-add_subdirectory(src)
-add_subdirectory(python_frontend)
+add_subdirectory(tools)
 
 # 7. 添加测试（可选，需启用BUILD_TESTING）
 add_subdirectory(test)

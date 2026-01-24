@@ -11,7 +11,6 @@
 # Neptune pde solver
 
 ```bash
-pip install "pybind11[global]"
 git submodule update --init
 bash scripts/build.sh
 
@@ -65,8 +64,7 @@ To debug individual lowering steps, you can also drive passes manually, e.g.:
 
 ## front-ends and runtime
 `lib/Codegen` / `lib/Utils` are currently stubs; only the C++/MLIR pipeline and
-`neptune-opt` driver are built. Python/pybind helpers and AOT runners are
-planned but not shipped yet.
+`neptune-opt` driver are built. AOT runners are planned but not shipped yet.
 
 ## PETSc integration
 - Enable at configure time with `-DNEPTUNE_ENABLE_PETSC=ON` (or `--enable-petsc` for `scripts/build.sh`).

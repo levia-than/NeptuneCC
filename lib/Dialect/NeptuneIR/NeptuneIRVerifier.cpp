@@ -4,417 +4,360 @@
  * @LastEditors: leviathan 670916484@qq.com
  * @LastEditTime: 2025-11-29 11:48:09
  * @FilePath: /neptune-pde-solver/lib/Dialect/NeptuneIR/NeptuneIRVerifier.cpp
- * @Description: 
- * 
- * Copyright (c) 2025 by leviathan, All Rights Reserved. 
+ * @Description:
+ *
+ * Copyright (c) 2025 by leviathan, All Rights Reserved.
  */
 #include "Dialect/NeptuneIR/NeptuneIRAttrs.h"
-#include "Dialect/NeptuneIR/NeptuneIROps.h"
 #include "Dialect/NeptuneIR/NeptuneIRDialect.h"
+#include "Dialect/NeptuneIR/NeptuneIROps.h"
+#include "Utils/NeptuneIRVerifierUtils.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
-#include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Builders.h"
-#include "mlir/IR/DialectImplementation.h"
 #include "mlir/IR/BuiltinOps.h"
-#include "mlir/Support/TypeID.h"
+#include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/DialectImplementation.h"
 #include "mlir/IR/SymbolTable.h"
+#include "mlir/Support/TypeID.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include "llvm/Support/Casting.h"
+
+#include <optional>
 
 using namespace mlir;
 using namespace mlir::Neptune::NeptuneIR;
 
-namespace {
-/// Conservative linearity check for linear_opdef:
-/// - single-block body
-/// - entry args match function type inputs
-/// - terminator is neptune_ir.return with types matching function results
-/// - operations restricted to a linear / analyzable subset
-LogicalResult verifyLinearApplyRegion(ApplyOp apply) {
-  if (!llvm::hasSingleElement(apply.getBody()))
-    return apply.emitOpError("apply region must have a single block");
-  Block &block = apply.getBody().front();
-  auto *terminator = block.getTerminator();
-  auto yield = dyn_cast<YieldOp>(terminator);
-  if (!yield)
-    return apply.emitOpError("apply region must terminate with neptune_ir.yield");
-
-  auto isAllowed = [](Operation *inner) {
-    return isa<AccessOp, YieldOp>(inner) ||
-           isa<arith::AddFOp, arith::AddIOp, arith::SubFOp, arith::SubIOp,
-               arith::MulFOp, arith::ConstantOp>(inner);
-  };
-  for (Operation &inner : block.getOperations()) {
-    if (&inner == terminator)
-      continue;
-    if (!isAllowed(&inner))
-      return inner.emitOpError("op not allowed inside apply for linear_opdef");
-  }
-  return success();
-}
-
-LogicalResult verifyLinearOpBody(LinearOpDefOp op, FunctionType funcTy) {
-  if (!llvm::hasSingleElement(op.getBody()))
-    return op.emitOpError("expects a single-block body");
-
-  Block &block = op.getBody().front();
-  if (block.getNumArguments() != funcTy.getNumInputs())
-    return op.emitOpError("block arg count must match function inputs");
-
-  for (auto it : llvm::zip(block.getArguments(), funcTy.getInputs())) {
-    if (std::get<0>(it).getType() != std::get<1>(it))
-      return op.emitOpError("block argument types must match function inputs");
-  }
-
-  auto *terminator = block.getTerminator();
-  auto ret = dyn_cast<ReturnOp>(terminator);
-  if (!ret)
-    return op.emitOpError("body must terminate with neptune_ir.return");
-  if (ret.getNumOperands() != funcTy.getNumResults())
-    return op.emitOpError("return operand count must match function results");
-  for (auto it : llvm::zip(ret.getOperands(), funcTy.getResults())) {
-    if (std::get<0>(it).getType() != std::get<1>(it))
-      return op.emitOpError("return operand types must match function results");
-  }
-
-  auto isAllowedOp = [](Operation *inner) {
-    return isa<AccessOp, ApplyOp, ApplyLinearOp, YieldOp, ReduceOp,
-               AsTensorOp, FromTensorOp, ReturnOp>(inner) ||
-           isa<arith::AddFOp, arith::AddIOp, arith::SubFOp, arith::SubIOp,
-               arith::MulFOp, arith::ConstantOp>(inner);
-  };
-
-  for (Operation &inner : block.getOperations()) {
-    if (&inner == terminator)
-      continue;
-
-    if (inner.getNumRegions() > 0 && !isa<ApplyOp>(&inner))
-      return inner.emitOpError(
-          "only neptune_ir.apply may contain regions in linear_opdef");
-
-    if (!isAllowedOp(&inner))
-      return inner.emitOpError("operation not allowed in linear_opdef body");
-
-    if (auto apply = dyn_cast<ApplyOp>(&inner)) {
-      if (failed(verifyLinearApplyRegion(apply)))
-        return failure();
-    }
-
-    if (auto iface = dyn_cast<MemoryEffectOpInterface>(&inner)) {
-      SmallVector<MemoryEffects::EffectInstance> effects;
-      iface.getEffects(effects);
-      bool hasWrite = llvm::any_of(
-          effects, [](const MemoryEffects::EffectInstance &eff) {
-            return isa<MemoryEffects::Write, MemoryEffects::Allocate>(
-                eff.getEffect());
-          });
-      if (hasWrite)
-        return inner.emitOpError(
-            "linear_opdef body must be free of writes/allocations");
+LogicalResult mlir::Neptune::NeptuneIR::BoundsAttr::verify(
+    function_ref<InFlightDiagnostic()> emitError, DenseI64ArrayAttr lb,
+    DenseI64ArrayAttr ub) {
+  auto lbVals = lb.asArrayRef();
+  auto ubVals = ub.asArrayRef();
+  if (lbVals.size() != ubVals.size())
+    return emitError() << "lb/ub must have the same rank";
+  if (lbVals.empty())
+    return emitError() << "bounds rank must be > 0";
+  for (size_t i = 0; i < lbVals.size(); ++i) {
+    if (lbVals[i] >= ubVals[i]) {
+      return emitError() << "invalid bounds at dim " << i
+                         << ": lb=" << lbVals[i] << " ub=" << ubVals[i];
     }
   }
   return success();
 }
-} // namespace
+
+LogicalResult mlir::Neptune::NeptuneIR::LocationAttr::verify(
+    function_ref<InFlightDiagnostic()> emitError, StringRef kind) {
+  if (kind == "cell" || kind == "vertex" || kind == "face_x" ||
+      kind == "face_y" || kind == "face_z") {
+    return success();
+  }
+  return emitError() << "unknown location kind: " << kind;
+}
+
+LogicalResult mlir::Neptune::NeptuneIR::LayoutAttr::verify(
+    function_ref<InFlightDiagnostic()> emitError, StringAttr order,
+    DenseI64ArrayAttr strides, DenseI64ArrayAttr halo,
+    DenseI64ArrayAttr offset) {
+  if (!order)
+    return emitError() << "layout order must be present";
+  StringRef orderStr = order.getValue();
+  if (orderStr != "xyz" && orderStr != "zyx")
+    return emitError() << "layout order must be \"xyz\" or \"zyx\"";
+
+  std::optional<size_t> refLen;
+  auto checkLen = [&](DenseI64ArrayAttr arr, StringRef name) -> LogicalResult {
+    if (!arr)
+      return success();
+    size_t len = arr.asArrayRef().size();
+    if (!refLen) {
+      refLen = len;
+      return success();
+    }
+    if (*refLen != len)
+      return emitError() << name << " length (" << len
+                         << ") must match other layout arrays (" << *refLen
+                         << ")";
+    return success();
+  };
+
+  if (failed(checkLen(strides, "strides")) || failed(checkLen(halo, "halo")) ||
+      failed(checkLen(offset, "offset")))
+    return failure();
+
+  if (strides) {
+    for (int64_t v : strides.asArrayRef())
+      if (v <= 0)
+        return emitError() << "layout strides must be > 0";
+  }
+  if (halo) {
+    for (int64_t v : halo.asArrayRef())
+      if (v < 0)
+        return emitError() << "layout halo must be >= 0";
+  }
+  if (offset) {
+    for (int64_t v : offset.asArrayRef())
+      if (v < 0)
+        return emitError() << "layout offset must be >= 0";
+  }
+
+  return success();
+}
+
+LogicalResult mlir::Neptune::NeptuneIR::FieldType::verify(
+    function_ref<InFlightDiagnostic()> emitError, Type elementType,
+    mlir::Neptune::NeptuneIR::BoundsAttr bounds,
+    mlir::Neptune::NeptuneIR::LocationAttr location,
+    mlir::Neptune::NeptuneIR::LayoutAttr layout) {
+  (void)location;
+
+  if (!llvm::isa<FloatType>(elementType) &&
+      !llvm::isa<IntegerType>(elementType))
+    return emitError() << "element type must be integer or float";
+
+  auto lbVals = bounds.getLb().asArrayRef();
+  auto ubVals = bounds.getUb().asArrayRef();
+  if (lbVals.size() != ubVals.size())
+    return emitError() << "bounds lb/ub rank mismatch";
+  if (lbVals.empty())
+    return emitError() << "bounds rank must be > 0";
+
+  size_t rank = lbVals.size();
+  if (layout) {
+    auto checkLen = [&](DenseI64ArrayAttr arr,
+                        StringRef name) -> LogicalResult {
+      if (!arr)
+        return success();
+      if (arr.asArrayRef().size() != rank)
+        return emitError() << name << " length must match bounds rank";
+      return success();
+    };
+
+    if (failed(checkLen(layout.getStrides(), "layout.strides")) ||
+        failed(checkLen(layout.getHalo(), "layout.halo")) ||
+        failed(checkLen(layout.getOffset(), "layout.offset")))
+      return failure();
+  }
+  return success();
+}
+
+LogicalResult mlir::Neptune::NeptuneIR::TempType::verify(
+    function_ref<InFlightDiagnostic()> emitError, Type elementType,
+    mlir::Neptune::NeptuneIR::BoundsAttr bounds,
+    mlir::Neptune::NeptuneIR::LocationAttr location) {
+  (void)location;
+
+  if (!llvm::isa<FloatType>(elementType) &&
+      !llvm::isa<IntegerType>(elementType))
+    return emitError() << "element type must be integer or float";
+
+  auto lbVals = bounds.getLb().asArrayRef();
+  auto ubVals = bounds.getUb().asArrayRef();
+  if (lbVals.size() != ubVals.size())
+    return emitError() << "bounds lb/ub rank mismatch";
+  if (lbVals.empty())
+    return emitError() << "bounds rank must be > 0";
+  return success();
+}
+
 
 LogicalResult WrapOp::verify() {
-  // TODO: 检查 memref elementType == field.element
+  auto memrefTy = dyn_cast<MemRefType>(getBuffer().getType());
+  if (!memrefTy)
+    return emitOpError("buffer must be a ranked memref");
+
+  auto fieldTy = getVarField().getType();
+  if (memrefTy.getElementType() != fieldTy.getElementType())
+    return emitOpError("buffer element type must match field element type");
+
+  if (memrefTy.getRank() !=
+      static_cast<int64_t>(fieldTy.getBounds().getLb().size()))
+    return emitOpError("buffer rank must match field bounds rank");
   return success();
 }
 
 LogicalResult UnwrapOp::verify() {
-  // TODO: 检查 field.element == memref.element
+  auto memrefTy = dyn_cast<MemRefType>(getBuffer().getType());
+  if (!memrefTy)
+    return emitOpError("buffer must be a ranked memref");
+
+  auto fieldTy = getVarField().getType();
+  if (memrefTy.getElementType() != fieldTy.getElementType())
+    return emitOpError("buffer element type must match field element type");
+
+  if (memrefTy.getRank() !=
+      static_cast<int64_t>(fieldTy.getBounds().getLb().size()))
+    return emitOpError("buffer rank must match field bounds rank");
   return success();
 }
 
 LogicalResult LoadOp::verify() {
-  // TODO: 检查 field / temp 的 elementType、bounds/location 一致
+  auto fieldTy = getVarField().getType();
+  auto tempTy = getResult().getType();
+  if (fieldTy.getElementType() != tempTy.getElementType())
+    return emitOpError("field/temp element type mismatch");
+  if (fieldTy.getBounds() != tempTy.getBounds())
+    return emitOpError("field/temp bounds mismatch");
+  if (fieldTy.getLocation() != tempTy.getLocation())
+    return emitOpError("field/temp location mismatch");
   return success();
 }
 
 LogicalResult AccessOp::verify() {
-  // TODO: 检查 offsets 维度是否匹配 temp 的维度等
+  auto tempTy = getInput().getType();
+  auto offsets = getOffsetsAttr().asArrayRef();
+  size_t rank = tempTy.getBounds().getLb().size();
+  if (offsets.size() != rank)
+    return emitOpError("offsets rank must match temp bounds rank");
+  if (getResult().getType() != tempTy.getElementType())
+    return emitOpError("result type must match temp element type");
   return success();
 }
 
 LogicalResult ApplyOp::verify() {
   auto bounds = getBounds();
-  unsigned rank = bounds.getLb().size();
+  auto applyLb = bounds.getLb().asArrayRef();
+  auto applyUb = bounds.getUb().asArrayRef();
+  unsigned rank = applyLb.size();
   if (rank == 0)
     return emitOpError("0-D apply not supported");
+  if (applyUb.size() != rank)
+    return emitOpError("bounds lb/ub rank mismatch");
+
+  if (getInputs().empty())
+    return emitOpError("apply requires at least one input");
+
+  auto firstInputTy = dyn_cast<TempType>(getInputs()[0].getType());
+  if (!firstInputTy)
+    return emitOpError("inputs must be TempType");
+
+  auto resTy = dyn_cast<TempType>(getResult().getType());
+  if (!resTy)
+    return emitOpError("result must be TempType");
+
+  for (Value v : getInputs()) {
+    auto ty = dyn_cast<TempType>(v.getType());
+    if (!ty)
+      return emitOpError("inputs must be TempType");
+    if (ty.getElementType() != firstInputTy.getElementType() ||
+        ty.getBounds() != firstInputTy.getBounds() ||
+        ty.getLocation() != firstInputTy.getLocation())
+      return emitOpError(
+          "all inputs must have the same element/bounds/location");
+  }
+
+  if (resTy.getElementType() != firstInputTy.getElementType() ||
+      resTy.getBounds() != firstInputTy.getBounds() ||
+      resTy.getLocation() != firstInputTy.getLocation())
+    return emitOpError("result must match input element/bounds/location");
+
+  auto inputBounds = firstInputTy.getBounds();
+  if (failed(detail::verifySubBounds(bounds, inputBounds,
+                                     [&]() { return emitOpError(); })))
+    return failure();
+
+  auto radiusOpt = getRadius();
+  if (radiusOpt) {
+    auto radius = *radiusOpt;
+    if (radius.size() != rank)
+      return emitOpError("radius rank must match bounds rank");
+    for (int64_t r : radius)
+      if (r < 0)
+        return emitOpError("radius values must be >= 0");
+
+    auto inLb = inputBounds.getLb().asArrayRef();
+    auto inUb = inputBounds.getUb().asArrayRef();
+    for (unsigned d = 0; d < rank; ++d) {
+      if (applyLb[d] < inLb[d] + radius[d] ||
+          applyUb[d] > inUb[d] - radius[d]) {
+        return emitOpError("apply bounds must be shrunk by radius at dim ")
+               << d;
+      }
+    }
+  }
+
+  auto shapeOpt = getShape();
+  if (shapeOpt) {
+    ArrayAttr offsets = shapeOpt->getOffsets();
+    for (Attribute attr : offsets) {
+      auto off = dyn_cast<DenseI64ArrayAttr>(attr);
+      if (!off)
+        return emitOpError("stencil_shape offsets must be dense_i64_array");
+      auto vals = off.asArrayRef();
+      if (vals.size() != rank)
+        return emitOpError("stencil_shape offset rank must match bounds rank");
+      if (radiusOpt) {
+        if (failed(detail::verifyOffsetsWithinRadius(
+                vals, *radiusOpt, [&]() { return emitOpError(); })))
+          return failure();
+      }
+    }
+  }
 
   Block &body = getBody().front();
-  unsigned numInputs = getInputs().size();
-
-  // 新规则：rank 个 index + numInputs 个 temp
-  if (body.getNumArguments() != rank + numInputs)
-    return emitOpError("apply-like region block arg count must be (bounds rank + number of inputs) = ")
-           << (rank + numInputs) << ", but got " << body.getNumArguments();
-
-  // 前 rank 个必须是 index
+  if (body.getNumArguments() != rank)
+    return emitOpError("apply region must have ") << rank << " index arguments";
   for (unsigned d = 0; d < rank; ++d) {
     if (!body.getArgument(d).getType().isIndex())
       return emitOpError("region arg #") << d << " must be index";
   }
 
-  // 后 numInputs 个必须与 operands 的类型一一对应
-  for (unsigned i = 0; i < numInputs; ++i) {
-    Type expect = getInputs()[i].getType();
-    Type got = body.getArgument(rank + i).getType();
-    if (got != expect)
-      return emitOpError("region input arg #") << (rank + i)
-             << " type mismatch: expect " << expect << " but got " << got;
+  if (radiusOpt) {
+    LogicalResult result = success();
+    body.walk([&](AccessOp acc) {
+      auto offs = acc.getOffsetsAttr().asArrayRef();
+      if (failed(detail::verifyOffsetsWithinRadius(
+              offs, *radiusOpt, [&]() { return acc.emitOpError(); })))
+        result = failure();
+    });
+    if (failed(result))
+      return failure();
   }
+
+  auto *terminator = body.getTerminator();
+  auto yield = dyn_cast<YieldOp>(terminator);
+  if (!yield)
+    return emitOpError("apply region must terminate with neptune_ir.yield");
+  if (yield.getNumOperands() != 1)
+    return emitOpError("apply region must yield a single scalar");
+  if (yield.getOperand(0).getType() != firstInputTy.getElementType())
+    return emitOpError("yield type must match input element type");
 
   return success();
 }
 
 LogicalResult StoreOp::verify() {
-  // TODO: 检查 value/temp 与目标 field elementType & bounds 兼容
-  return success();
-}
+  auto tempTy = getValue().getType();
+  auto fieldTy = getVarField().getType();
+  if (tempTy.getElementType() != fieldTy.getElementType())
+    return emitOpError("temp/field element type mismatch");
+  if (tempTy.getLocation() != fieldTy.getLocation())
+    return emitOpError("temp/field location mismatch");
 
-LogicalResult ReduceOp::verify() {
-  return success();
-}
+  auto tempBounds = tempTy.getBounds();
+  auto fieldBounds = fieldTy.getBounds();
+  if (tempBounds.getLb().size() != fieldBounds.getLb().size())
+    return emitOpError("temp/field bounds rank mismatch");
 
-LogicalResult LinearOpDefOp::verify() {
-  auto funcTy = dyn_cast<FunctionType>(getFunctionType());
-  if (!funcTy)
-    return emitOpError("function_type must be a FunctionType");
-  for (Type ty : funcTy.getInputs()) {
-    if (!isa<TempType>(ty))
-      return emitOpError("inputs of linear_opdef must be TempType");
-  }
-  for (Type ty : funcTy.getResults()) {
-    if (!isa<TempType>(ty))
-      return emitOpError("results of linear_opdef must be TempType");
-  }
-  if (failed(verifyLinearOpBody(*this, funcTy)))
-    return failure();
-  return success();
-}
-
-LogicalResult ApplyLinearOp::verify() {
-  return success();
-}
-
-LogicalResult AsTensorOp::verify() {
-  return success();
-}
-
-LogicalResult FromTensorOp::verify() {
-  return success();
-}
-
-LogicalResult AssembleMatrixOp::verify() {
-  auto memrefTy = dyn_cast<MemRefType>(getMatrix().getType());
-  if (!memrefTy)
-    return emitOpError("result must be a memref");
-
-  if (memrefTy.getRank() != 2)
-    return emitOpError("result memref must be rank-2");
-
-  if (!memrefTy.isDynamicDim(0) || !memrefTy.isDynamicDim(1))
-    return emitOpError("result memref must have dynamic dims (?x?)");
-
-  auto elemTy = dyn_cast<FloatType>(memrefTy.getElementType());
-  if (!elemTy || elemTy.getWidth() != 64)
-    return emitOpError("result element type must be f64 (MVP)");
-
-  // 2) resolve symbol
-  auto sym = getOp();
-  if (!sym)
-    return emitOpError("requires symbol reference");
-
-  Operation *target = SymbolTable::lookupNearestSymbolFrom(*this, sym);
-  if (!target)
-    return emitOpError("op must reference an existing symbol");
-
-  // 3) accept linear_opdef OR func.func (post-structure-lowering)
-  FunctionType funcTy;
-  if (auto def = dyn_cast<LinearOpDefOp>(target)) {
-    funcTy = dyn_cast<FunctionType>(def.getFunctionType());
-  } else if (auto fn = dyn_cast<func::FuncOp>(target)) {
-    funcTy = fn.getFunctionType();
-  } else if (auto fnIfc = dyn_cast<FunctionOpInterface>(target)) {
-    funcTy = dyn_cast<FunctionType>(fnIfc.getFunctionType());
-  } else {
-    return emitOpError("op must reference a callable symbol (linear_opdef or func.func)");
-  }
-
-  if (!funcTy)
-    return emitOpError("referenced symbol must have a FunctionType");
-
-  // 4) enforce signature element type is f64 (不要放过 i32 这种情况)
-  auto checkArgOrRes = [&](Type ty, StringRef what) -> LogicalResult {
-    if (auto t = dyn_cast<TempType>(ty)) {
-      auto et = dyn_cast<FloatType>(t.getElementType());
-      if (!et || et.getWidth() != 64)
-        return emitOpError() << what << " element type must be f64 for assemble_matrix MVP";
-      return success();
-    }
-
-    // 如果你未来允许在 dataflow 后再 assemble，可以加 memref 路径：
-    if (auto mr = dyn_cast<MemRefType>(ty)) {
-      auto et = dyn_cast<FloatType>(mr.getElementType());
-      if (!et || et.getWidth() != 64)
-        return emitOpError() << what << " element type must be f64 for assemble_matrix MVP";
-      return success();
-    }
-
-    return emitOpError() << what << " must be TempType (or memref after lowering) for assemble_matrix MVP";
-  };
-
-  for (Type ty : funcTy.getInputs())
-    if (failed(checkArgOrRes(ty, "operator input")))
+  if (auto bounds = getBounds()) {
+    if (failed(detail::verifySubBounds(*bounds, fieldBounds,
+                                       [&]() { return emitOpError(); })))
       return failure();
-
-  for (Type ty : funcTy.getResults())
-    if (failed(checkArgOrRes(ty, "operator result")))
+    if (failed(detail::verifySubBounds(*bounds, tempBounds,
+                                       [&]() { return emitOpError(); })))
       return failure();
-
+  } else if (tempBounds != fieldBounds) {
+    return emitOpError("store without bounds requires temp/field bounds match");
+  }
   return success();
 }
 
-LogicalResult SolveLinearOp::verify() {
-  auto memrefTy = dyn_cast<MemRefType>(getSystem().getType());
-  if (!memrefTy)
-    return emitOpError("system must be a memref");
-  if (!memrefTy.hasRank() || memrefTy.getRank() != 2 || !memrefTy.isDynamicDim(0) ||
-      !memrefTy.isDynamicDim(1))
-    return emitOpError("system memref must be memref<?x?xf64>");
-  auto elemTy = dyn_cast<FloatType>(memrefTy.getElementType());
-  if (!elemTy || elemTy.getWidth() != 64)
-    return emitOpError("system element type must be f64");
-
-  auto rhsTy = dyn_cast<TempType>(getRhs().getType());
-  auto resTy = dyn_cast<TempType>(getResult().getType());
-  if (!rhsTy || !resTy)
-    return emitOpError("rhs/result must be TempType");
-  auto rhsElem = dyn_cast<FloatType>(rhsTy.getElementType());
-  auto resElem = dyn_cast<FloatType>(resTy.getElementType());
-  if (!rhsElem || rhsElem.getWidth() != 64 || !resElem || resElem.getWidth() != 64)
-    return emitOpError("rhs/result Temp element type must be f64");
-  return success();
-}
-
-LogicalResult SolveNonlinearOp::verify() {
-  return success();
-}
-
-LogicalResult TimeAdvanceOp::verify() {
-  // 1) state/result type 必须一致
-  auto stTy  = getState().getType();
-  auto outTy = getResult().getType();
-  if (stTy != outTy)
-    return emitOpError("result type must match state type, got state=")
-           << stTy << " result=" << outTy;
-
-  // 2) dt 必须是“标量数值”：float / integer / index
-  mlir::Type dtTy = getDt().getType();
-
-  // 不允许 shaped（比如 tensor/memref）
-  if (isa<mlir::ShapedType>(dtTy))
-    return emitOpError("dt must be a scalar numeric type, but got shaped type ")
-           << dtTy;
-
-  if (isa<mlir::FloatType>(dtTy)) {
-    return mlir::success();
-  }
-  if (isa<mlir::IndexType>(dtTy)) {
-    return mlir::success();
-  }
-  if (auto it = dyn_cast<mlir::IntegerType>(dtTy)) {
-    // i1 作为 dt 基本没意义，直接拒绝；宽度太大也拒绝（lowering 要转到 i64/f64）
-    if (it.getWidth() == 1)
-      return emitOpError("dt integer type must not be i1");
-    if (it.getWidth() > 64)
-      return emitOpError("dt integer width > 64 is not supported (got ")
-             << it.getWidth() << ")";
-    return mlir::success();
-  }
-
-  return emitOpError("dt must be float/index/integer scalar, but got ") << dtTy;
-}
-
-LogicalResult NonlinearOpDefOp::verify() {
-  return success();
-}
-
-LogicalResult ApplyNonLinearOp::verify() {
-  return success();
-}
-
-LogicalResult TimeAdvanceRuntimeOp::verify() {
-  // 1) state/result type 必须一致
-  auto stTy  = getState().getType();
-  auto outTy = getResult().getType();
-  if (stTy != outTy)
-    return emitOpError("result type must match state type, got state=")
-           << stTy << " result=" << outTy;
-
-  // 2) dt 必须是“标量数值”：float / integer / index
-  mlir::Type dtTy = getDt().getType();
-
-  // 不允许 shaped（比如 tensor/memref）
-  if (isa<mlir::ShapedType>(dtTy))
-    return emitOpError("dt must be a scalar numeric type, but got shaped type ")
-           << dtTy;
-
-  if (isa<mlir::FloatType>(dtTy)) {
-    return mlir::success();
-  }
-  if (isa<mlir::IndexType>(dtTy)) {
-    return mlir::success();
-  }
-  if (auto it = dyn_cast<mlir::IntegerType>(dtTy)) {
-    // i1 作为 dt 基本没意义，直接拒绝；宽度太大也拒绝（lowering 要转到 i64/f64）
-    if (it.getWidth() == 1)
-      return emitOpError("dt integer type must not be i1");
-    if (it.getWidth() > 64)
-      return emitOpError("dt integer width > 64 is not supported (got ")
-             << it.getWidth() << ")";
-    return mlir::success();
-  }
-
-  return emitOpError("dt must be float/index/integer scalar, but got ") << dtTy;
-}
+LogicalResult ReduceOp::verify() { return success(); }
 
 void StoreOp::getEffects(
-  SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
   // 最保守：写目标 field（按 pointer 语义看待）
   OpOperand &fieldOperand = getOperation()->getOpOperand(1);
   effects.emplace_back(MemoryEffects::Write::get(), &fieldOperand);
-}
-
-void AssembleMatrixOp::getEffects(
-  SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
-  effects.emplace_back(MemoryEffects::Allocate::get());
-  effects.emplace_back(MemoryEffects::Read::get());
-}
-
-void SolveLinearOp::getEffects(
-  SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
-  // TODO: 精细标注 solver 的读写/分配；此处保守为未知副作用
-  effects.emplace_back(MemoryEffects::Write::get());
-}
-
-void SolveNonlinearOp::getEffects(
-  SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
-  // TODO: 精细标注求解过程的读写/分配；此处保守为未知副作用
-  effects.emplace_back(MemoryEffects::Write::get());
-}
-
-void TimeAdvanceOp::getEffects(
-  SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
-  // Time advancement may mutate state; conservatively mark as write.
-  effects.emplace_back(MemoryEffects::Write::get());
-}
-
-void TimeAdvanceRuntimeOp::getEffects(
-  SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
-  // Time advancement may mutate state; conservatively mark as write.
-  effects.emplace_back(MemoryEffects::Write::get());
 }

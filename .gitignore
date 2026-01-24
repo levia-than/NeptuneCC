@@ -8,3 +8,4 @@ compile_commands.json
 __pycache__/
 *.egg-info/
 .pytest_cache/
+_neptune_mlir.cpython-312-x86_64-linux-gnu.so

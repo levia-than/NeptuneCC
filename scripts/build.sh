@@ -9,7 +9,7 @@ BUILD_ROOT="${REPO_ROOT}/build"
 
 # LLVM 配置
 LLVM_TAG="llvmorg-21.0.0"
-LLVM_PROJECTS="mlir"
+LLVM_PROJECTS="mlir;clang;clang-tools-extra"
 LLVM_TARGETS="X86"
 LLVM_BUILD_DIR="${BUILD_ROOT}/llvm-build"
 LLVM_INSTALL_DIR="${BUILD_ROOT}/llvm-install"
@@ -196,6 +196,7 @@ build_neptune() {
         "-DCMAKE_INSTALL_PREFIX=${INSTALL_PREFIX}"
         "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"
         "-DMLIR_DIR=${LLVM_INSTALL_DIR}/lib/cmake/mlir"
+        "-DClang_DIR=${LLVM_INSTALL_DIR}/lib/cmake/clang"
         "-DLLVM_DIR=${LLVM_INSTALL_DIR}/lib/cmake/llvm"
         "-DLLVM_EXTERNAL_LIT=${LLVM_BUILD_DIR}/bin/llvm-lit"
         "-DNEPTUNE_ENABLE_PETSC=${ENABLE_PETSC}"
@@ -229,6 +230,4 @@ build_neptune
 
 log "Build Complete!"
 echo "=================================================================="
-echo -e "${GREEN}To use the Python frontend, set PYTHONPATH:${NC}"
-echo "export PYTHONPATH=${REPO_ROOT}/python_frontend:\$PYTHONPATH"
 echo "=================================================================="

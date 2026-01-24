@@ -3,87 +3,52 @@
 
 include "mlir/Pass/PassBase.td"
 
-def NeptuneIRVerifyAnnotatePass : Pass<"neptune-ir-verify-annotate", "mlir::ModuleOp"> {
-  let summary = "verify NeptuneIR contracts and attach structure keys";
+def NeptuneIRVerifyFormsPass : Pass<"neptune-ir-verify-forms", "mlir::ModuleOp"> {
+  let summary = "verify NeptuneIR structural invariants (apply/access/temp/field)";
   let dependentDialects = [
-    "mlir::func::FuncDialect",
-    "mlir::arith::ArithDialect",
     "Neptune::NeptuneIR::NeptuneIRDialect"
   ];
 }
 
-def NeptuneIRHighLevelConvertionPass : Pass<"neptune-ir-high-level-convertion", "mlir::ModuleOp"> {
-  let summary = "convert high level op, such as TimeAdvanceOp to linear-related op";
+def NeptuneIRNormalizeApplyPass
+    : Pass<"neptune-ir-normalize-apply", "mlir::ModuleOp"> {
+  let summary = "Normalize neptune.ir.apply: infer/verify radius, canonicalize access";
   let dependentDialects = [
-    "mlir::func::FuncDialect",
     "mlir::arith::ArithDialect",
+    "mlir::func::FuncDialect",
     "Neptune::NeptuneIR::NeptuneIRDialect"
   ];
 }
 
-def NeptuneIRStructureLoweringPass : Pass<"neptune-ir-structure-lowering", "mlir::ModuleOp"> {
-  let summary = "lower NeptuneIR structure: opdef/apply_{linear,nonlinear} to func";
+def NeptuneIRSplitDomainPass : Pass<"neptune-ir-split-domain", "mlir::ModuleOp"> {
+  let summary = "split apply into interior/boundary regions for overlap/codegen";
   let dependentDialects = [
-    "mlir::func::FuncDialect",
-    "mlir::arith::ArithDialect",
-    "Neptune::NeptuneIR::NeptuneIRDialect"
-  ];
-}
-
-def NeptuneIRDataflowLoweringPass : Pass<"neptune-ir-dataflow-lowering", "mlir::ModuleOp"> {
-  let summary = "lower NeptuneIR dataflow: apply/access/storage/reduce";
-  let dependentDialects = [
-    "mlir::func::FuncDialect",
-    "mlir::arith::ArithDialect",
-    "mlir::memref::MemRefDialect",
-    "mlir::scf::SCFDialect",
-    "mlir::gpu::GPUDialect",
     "Neptune::NeptuneIR::NeptuneIRDialect"
   ];
 
   let options = [
-    Option<"backend", "backend",
-           "::mlir::Neptune::NeptuneIR::DataflowBackend",
-           /*default=*/"::mlir::Neptune::NeptuneIR::DataflowBackend::cpu",
-           "dataflow backend", [{
-             llvm::cl::values(
-               clEnumValN(::mlir::Neptune::NeptuneIR::DataflowBackend::cpu,
-                          "cpu", "Lower apply/access to SCF+memref (CPU)"),
-               clEnumValN(::mlir::Neptune::NeptuneIR::DataflowBackend::gpu,
-                          "gpu", "Lower apply/access to gpu.launch (GPU)")
-             )
-           }]>,
+    Option<"mode", "mode", "std::string", "\"interior-boundary\"",
+           "split mode: interior-boundary | interior-only | none">,
+    Option<"keepOriginal", "keep-original", "bool", /*default=*/"false",
+           "keep the original apply after splitting">
   ];
 }
 
-
-def NeptuneIRRuntimeLoweringPass : Pass<"neptune-ir-runtime-lowering", "mlir::ModuleOp"> {
-  let summary = "lower NeptuneIR runtime ops to shim calls (petsc/cuda/hip/native)";
+def NeptuneIREmitCHalidePass
+    : Pass<"neptune-ir-emitc-halide", "mlir::ModuleOp"> {
+  let summary = "Emit Halide Generator C++ via EmitC (one file for all apply kernels)";
   let dependentDialects = [
-    "mlir::func::FuncDialect",
+    "mlir::emitc::EmitCDialect",
     "mlir::arith::ArithDialect",
-    "mlir::memref::MemRefDialect",
+    "mlir::func::FuncDialect",
     "Neptune::NeptuneIR::NeptuneIRDialect"
   ];
 
   let options = [
-    Option<"runtime", "runtime",
-           "::mlir::Neptune::NeptuneIR::RuntimeKind",
-           /*default=*/"::mlir::Neptune::NeptuneIR::RuntimeKind::petsc",
-           "runtime kind", [{
-             llvm::cl::values(
-               clEnumValN(::mlir::Neptune::NeptuneIR::RuntimeKind::petsc,
-                          "petsc", "Lower to PETSc shim runtime"),
-               clEnumValN(::mlir::Neptune::NeptuneIR::RuntimeKind::cuda,
-                          "cuda", "Lower to CUDA libraries/runtime"),
-               clEnumValN(::mlir::Neptune::NeptuneIR::RuntimeKind::hip,
-                          "hip", "Lower to HIP libraries/runtime"),
-               clEnumValN(::mlir::Neptune::NeptuneIR::RuntimeKind::native,
-                          "native", "Lower to a built-in/native runtime")
-             )
-           }]>,
+    Option<"outFile", "out-file", "std::string",
+           /*default=*/"\"neptune_kernels_generators.cpp\"",
+           "emitc output filename for generated halide generators">
   ];
 }
 
-
-#endif
+#endif // NEPTUNEIR_PASSES_TD

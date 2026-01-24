@@ -3,9 +3,10 @@
 
 include "mlir/IR/BuiltinAttributes.td"
 include "mlir/IR/EnumAttr.td"
+include "mlir/IR/CommonAttrConstraints.td" 
+include "mlir/IR/AttrTypeBase.td"
 include "NeptuneIRDialect.td"
 
-// 迭代域 [lb[i], ub[i])，用于 interior / boundary / 子域等。
 def NeptuneIR_BoundsAttr
     : NeptuneIR_Attr<"Bounds", "bounds"> {
   let summary = "iteration bounds [lb, ub) for stencil domains";
@@ -23,9 +24,10 @@ def NeptuneIR_BoundsAttr
   let assemblyFormat = [{
     `<` `lb` `=` $lb `,` `ub` `=` $ub `>`
   }];
+
+  let genVerifyDecl = 1;
 }
 
-// 场在网格上的“位置”，给 FDM / FVM 用。
 def NeptuneIR_LocationAttr
     : NeptuneIR_Attr<"Location", "location"> {
   let summary = "location of a field on the grid (cell/vertex/face)";
@@ -46,6 +48,8 @@ def NeptuneIR_LocationAttr
   let assemblyFormat = [{
     `<` $kind `>`
   }];
+
+  let genVerifyDecl = 1;
 }
 
 // Stencil 形状描述：一组 offset 向量
@@ -74,6 +78,29 @@ def NeptuneIR_StencilShapeAttr
     `<` $offsets `>`
   }];
 }
+
+def NeptuneIR_LayoutAttr : NeptuneIR_Attr<"Layout", "layout"> {
+  let summary = "storage layout for a structured grid buffer";
+  let parameters = (ins
+    // 推荐用 StringAttr：打印/解析最稳（order="xyz" 这种）
+    "::mlir::StringAttr":$order,  // e.g. "xyz" / "zyx"
+
+    OptionalParameter<"::mlir::DenseI64ArrayAttr">:$strides, // [sx, sy, sz]
+    OptionalParameter<"::mlir::DenseI64ArrayAttr">:$halo,    // [hx, hy, hz]
+    OptionalParameter<"::mlir::DenseI64ArrayAttr">:$offset   // [ox, oy, oz]
+  );
+
+  let assemblyFormat = [{
+    `<` `order` `=` $order
+       (`,` `strides` `=` $strides^)?
+       (`,` `halo`    `=` $halo^)?
+       (`,` `offset`  `=` $offset^)?
+    `>`
+  }];
+
+  let genVerifyDecl = 1;
+}
+
 
 def NeptuneIR_TimeMethodAttr : I32EnumAttr<"TimeMethod", "", [
   I32EnumAttrCase<"kExplicit", 0, "explicit">,

@@ -6,6 +6,7 @@
 #include <dlfcn.h>
 #include <petsc.h>
 #include <petscksp.h>
+#include <petscmat.h>
 #include <string>
 #include <vector>
 
@@ -1485,6 +1486,17 @@ run_snes_common(const char *prefixName, const char *residual_sym, double tol,
       SNESSetFunction(ctx.snes, ctx.f, &NLSpec::FormFunction, &ctx),
       "SNESSetFunction failed");
 
+  // TODO: 这不是正确实现！应该容许默认的Jacobian，或者用户指定的！
+    // --- Jacobian: default to matrix-free finite-difference (MFFD) ---
+  Mat J = nullptr;
+  neptunePetscCheck(MatCreateSNESMF(ctx.snes, &J), "MatCreateSNESMF failed");
+  neptunePetscCheck(MatSetFromOptions(J), "MatSetFromOptions(J) failed");
+
+  // Use the same operator for J and P for now (simplest)
+  neptunePetscCheck(
+      SNESSetJacobian(ctx.snes, J, J, MatMFFDComputeJacobian, nullptr),
+      "SNESSetJacobian(MFFD) failed");
+
   neptunePetscCheck(SNESSetFromOptions(ctx.snes), "SNESSetFromOptions failed");
   neptunePetscCheck(SNESSetUp(ctx.snes), "SNESSetUp failed");
 
@@ -1493,6 +1505,35 @@ run_snes_common(const char *prefixName, const char *residual_sym, double tol,
                     "VecPlaceArray(x) failed");
 
   neptunePetscCheck(SNESSolve(ctx.snes, nullptr, ctx.x), "SNESSolve failed");
+
+  SNESConvergedReason reason;
+  PetscInt its = 0;
+  PetscReal fnorm = 0.0;
+
+  neptunePetscCheck(SNESGetConvergedReason(ctx.snes, &reason),
+                    "SNESGetConvergedReason failed");
+  neptunePetscCheck(SNESGetIterationNumber(ctx.snes, &its),
+                    "SNESGetIterationNumber failed");
+  neptunePetscCheck(SNESGetFunctionNorm(ctx.snes, &fnorm),
+                    "SNESGetFunctionNorm failed");
+
+  neptunePetscCheck(
+      PetscPrintf(PETSC_COMM_SELF, "===== SNES Solver Results =====\n"),
+      "PetscPrintf failed");
+  neptunePetscCheck(
+      PetscPrintf(PETSC_COMM_SELF, "Iteration count: %d\n", (int)its),
+      "PetscPrintf failed");
+  neptunePetscCheck(
+      PetscPrintf(PETSC_COMM_SELF, "Final residual norm: %.10e\n",
+                  (double)fnorm),
+      "PetscPrintf failed");
+  neptunePetscCheck(PetscPrintf(PETSC_COMM_SELF,
+                                "Convergence reason enum: %d\n", (int)reason),
+                    "PetscPrintf failed");
+
+  neptunePetscCheck(
+      SNESConvergedReasonView(ctx.snes, PETSC_VIEWER_STDOUT_SELF),
+      "SNESConvergedReasonView failed");
 
   neptunePetscCheck(VecResetArray(ctx.x), "VecResetArray(x) failed");
 
@@ -1505,6 +1546,8 @@ run_snes_common(const char *prefixName, const char *residual_sym, double tol,
     SNESDestroy(&ctx.snes);
   if (ctx.opts)
     PetscOptionsDestroy(&ctx.opts);
+  if (J)
+    MatDestroy(&J);
 
   return buildOut();
 }
@@ -1517,6 +1560,9 @@ run_snes_common(const char *prefixName, const char *residual_sym, double tol,
 extern "C" NeptuneMemRef0D _neptune_rt_runtime_solve_nonlinear_0d_0cap(
     void *x_alloc, void *x_aligned, int64_t x_off, const char *residual_sym,
     double tol, int64_t max_iters, const char *petsc_options) {
+  std::fprintf(stderr,
+               "[NeptuneRT] x(memref) x_alloc=%p x_aligned=%p x_off=%ld\n",
+               x_alloc, x_aligned, (long)x_off);
 
   if (!x_aligned || !residual_sym || !residual_sym[0]) {
     std::fprintf(stderr, "[NeptuneRT] solve_nonlinear_0d_0cap: bad args\n");
@@ -1543,6 +1589,12 @@ extern "C" NeptuneMemRef0D _neptune_rt_runtime_solve_nonlinear_0d_1cap(
     void *x_alloc, void *x_aligned, int64_t x_off, void *c0_alloc,
     void *c0_aligned, int64_t c0_off, const char *residual_sym, double tol,
     int64_t max_iters, const char *petsc_options) {
+  std::fprintf(stderr,
+               "[NeptuneRT] x(memref) x_alloc=%p x_aligned=%p x_off=%ld\n",
+               x_alloc, x_aligned, (long)x_off);
+  std::fprintf(stderr,
+               "[NeptuneRT] c0(memref) c0_alloc=%p c0_aligned=%p c0_off=%ld\n",
+               c0_alloc, c0_aligned, (long)c0_off);
 
   if (!x_aligned || !c0_aligned || !residual_sym || !residual_sym[0]) {
     std::fprintf(stderr, "[NeptuneRT] solve_nonlinear_0d_1cap: bad args\n");
@@ -1571,6 +1623,15 @@ extern "C" NeptuneMemRef0D _neptune_rt_runtime_solve_nonlinear_0d_2cap(
     void *c0_aligned, int64_t c0_off, void *c1_alloc, void *c1_aligned,
     int64_t c1_off, const char *residual_sym, double tol, int64_t max_iters,
     const char *petsc_options) {
+  std::fprintf(stderr,
+               "[NeptuneRT] x(memref) x_alloc=%p x_aligned=%p x_off=%ld\n",
+               x_alloc, x_aligned, (long)x_off);
+  std::fprintf(stderr,
+               "[NeptuneRT] c0(memref) c0_alloc=%p c0_aligned=%p c0_off=%ld\n",
+               c0_alloc, c0_aligned, (long)c0_off);
+  std::fprintf(stderr,
+               "[NeptuneRT] c1(memref) c1_alloc=%p c1_aligned=%p c1_off=%ld\n",
+               c1_alloc, c1_aligned, (long)c1_off);
 
   if (!x_aligned || !c0_aligned || !c1_aligned || !residual_sym ||
       !residual_sym[0]) {
@@ -1603,6 +1664,10 @@ extern "C" NeptuneMemRef1D _neptune_rt_runtime_solve_nonlinear_1d_0cap(
     void *x_alloc, void *x_aligned, int64_t x_off, int64_t x_s0, int64_t x_st0,
     const char *residual_sym, double tol, int64_t max_iters,
     const char *petsc_options) {
+  std::fprintf(stderr,
+               "[NeptuneRT] x(memref) x_alloc=%p x_aligned=%p x_off=%ld "
+               "x_s0=%ld x_st0=%ld\n",
+               x_alloc, x_aligned, (long)x_off, (long)x_s0, (long)x_st0);
 
   if (!x_aligned || x_s0 <= 0 || !residual_sym || !residual_sym[0]) {
     std::fprintf(stderr, "[NeptuneRT] solve_nonlinear_1d_0cap: bad args\n");
@@ -1679,6 +1744,20 @@ extern "C" NeptuneMemRef1D _neptune_rt_runtime_solve_nonlinear_1d_2cap(
     int64_t c0_st0, void *c1_alloc, void *c1_aligned, int64_t c1_off,
     int64_t c1_s0, int64_t c1_st0, const char *residual_sym, double tol,
     int64_t max_iters, const char *petsc_options) {
+  std::fprintf(stderr,
+               "[NeptuneRT] x(memref) x_alloc=%p x_aligned=%p x_off=%ld "
+               "x_s0=%ld x_st0=%ld\n",
+               x_alloc, x_aligned, (long)x_off, (long)x_s0, (long)x_st0);
+  std::fprintf(stderr,
+               "[NeptuneRT] c0(memref) c0_alloc=%p c0_aligned=%p c0_off=%ld "
+               "c0_s0=%ld c0_st0=%ld\n",
+               c0_alloc, c0_aligned, (long)c0_off, (long)c0_s0,
+               (long)c0_st0);
+  std::fprintf(stderr,
+               "[NeptuneRT] c1(memref) c1_alloc=%p c1_aligned=%p c1_off=%ld "
+               "c1_s0=%ld c1_st0=%ld\n",
+               c1_alloc, c1_aligned, (long)c1_off, (long)c1_s0,
+               (long)c1_st0);
 
   if (!x_aligned || !c0_aligned || !c1_aligned || x_s0 <= 0 || c0_s0 != x_s0 ||
       c1_s0 != x_s0 || !residual_sym || !residual_sym[0]) {
@@ -1713,6 +1792,11 @@ extern "C" NeptuneMemRef2D _neptune_rt_runtime_solve_nonlinear_2d_0cap(
     void *x_alloc, void *x_aligned, int64_t x_off, int64_t x_s0, int64_t x_s1,
     int64_t x_st0, int64_t x_st1, const char *residual_sym, double tol,
     int64_t max_iters, const char *petsc_options) {
+  std::fprintf(stderr,
+               "[NeptuneRT] x(memref) x_alloc=%p x_aligned=%p x_off=%ld "
+               "x_s=(%ld,%ld) x_st=(%ld,%ld)\n",
+               x_alloc, x_aligned, (long)x_off, (long)x_s0, (long)x_s1,
+               (long)x_st0, (long)x_st1);
 
   if (!x_aligned || x_s0 <= 0 || x_s1 <= 0 || !residual_sym ||
       !residual_sym[0]) {
@@ -1748,6 +1832,16 @@ extern "C" NeptuneMemRef2D _neptune_rt_runtime_solve_nonlinear_2d_1cap(
     int64_t c0_off, int64_t c0_s0, int64_t c0_s1, int64_t c0_st0,
     int64_t c0_st1, const char *residual_sym, double tol, int64_t max_iters,
     const char *petsc_options) {
+  std::fprintf(stderr,
+               "[NeptuneRT] x(memref) x_alloc=%p x_aligned=%p x_off=%ld "
+               "x_s=(%ld,%ld) x_st=(%ld,%ld)\n",
+               x_alloc, x_aligned, (long)x_off, (long)x_s0, (long)x_s1,
+               (long)x_st0, (long)x_st1);
+  std::fprintf(stderr,
+               "[NeptuneRT] c0(memref) c0_alloc=%p c0_aligned=%p c0_off=%ld "
+               "c0_s=(%ld,%ld) c0_st=(%ld,%ld)\n",
+               c0_alloc, c0_aligned, (long)c0_off, (long)c0_s0, (long)c0_s1,
+               (long)c0_st0, (long)c0_st1);
 
   if (!x_aligned || !c0_aligned || x_s0 <= 0 || x_s1 <= 0 || c0_s0 != x_s0 ||
       c0_s1 != x_s1 || !residual_sym || !residual_sym[0]) {
@@ -1787,6 +1881,21 @@ extern "C" NeptuneMemRef2D _neptune_rt_runtime_solve_nonlinear_2d_2cap(
     int64_t c1_s0, int64_t c1_s1, int64_t c1_st0, int64_t c1_st1,
     const char *residual_sym, double tol, int64_t max_iters,
     const char *petsc_options) {
+  std::fprintf(stderr,
+               "[NeptuneRT] x(memref) x_alloc=%p x_aligned=%p x_off=%ld "
+               "x_s=(%ld,%ld) x_st=(%ld,%ld)\n",
+               x_alloc, x_aligned, (long)x_off, (long)x_s0, (long)x_s1,
+               (long)x_st0, (long)x_st1);
+  std::fprintf(stderr,
+               "[NeptuneRT] c0(memref) c0_alloc=%p c0_aligned=%p c0_off=%ld "
+               "c0_s=(%ld,%ld) c0_st=(%ld,%ld)\n",
+               c0_alloc, c0_aligned, (long)c0_off, (long)c0_s0, (long)c0_s1,
+               (long)c0_st0, (long)c0_st1);
+  std::fprintf(stderr,
+               "[NeptuneRT] c1(memref) c1_alloc=%p c1_aligned=%p c1_off=%ld "
+               "c1_s=(%ld,%ld) c1_st=(%ld,%ld)\n",
+               c1_alloc, c1_aligned, (long)c1_off, (long)c1_s0, (long)c1_s1,
+               (long)c1_st0, (long)c1_st1);
 
   if (!x_aligned || !c0_aligned || !c1_aligned || x_s0 <= 0 || x_s1 <= 0 ||
       c0_s0 != x_s0 || c0_s1 != x_s1 || c1_s0 != x_s0 || c1_s1 != x_s1 ||

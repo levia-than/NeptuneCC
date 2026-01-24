@@ -19,18 +19,20 @@ def NeptuneIR_FieldType
     face-centered (for FVM).
   }];
 
-  let parameters =
-    (ins "Type":$elementType,
-         NeptuneIR_BoundsAttr:$bounds,
-         NeptuneIR_LocationAttr:$location);
+let parameters = (ins "Type":$elementType,
+                      NeptuneIR_BoundsAttr:$bounds,
+                      NeptuneIR_LocationAttr:$location,
+                      NeptuneIR_LayoutAttr:$layout);
+                      
+let assemblyFormat = [{
+  `<` `element` `=` $elementType `,`
+     `bounds` `=` $bounds `,`
+     `location` `=` $location `,`
+     `layout` `=` $layout
+  `>`
+}];
 
-  let assemblyFormat = [{
-    `<`
-      `element`  `=` $elementType `,`
-      `bounds`   `=` $bounds      `,`
-      `location` `=` $location
-    `>`
-  }];
+  let genVerifyDecl = 1;
 }
 
 // TempType: 值语义临时场，是 apply 的输入/输出类型。
@@ -56,6 +58,8 @@ def NeptuneIR_TempType
       `location` `=` $location
     `>`
   }];
+
+  let genVerifyDecl = 1;
 }
 
 #endif // NEPTUNEIR_TYPES_TD

@@ -14,6 +14,10 @@
 #include "mlir/Pass/PassRegistry.h"
 #include "mlir/Support/FileUtilities.h"
 #include "mlir/Tools/mlir-opt/MlirOptMain.h"
+#include "mlir/Dialect/EmitC/IR/EmitC.h"
+// 如果你要在同一个二进制里跑 convert passes：
+#include "mlir/Dialect/EmitC/Transforms/Passes.h"
+
 
 #include "Dialect/NeptuneIR/NeptuneIRAttrs.h"
 #include "Dialect/NeptuneIR/NeptuneIRDialect.h"

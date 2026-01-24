@@ -4,7 +4,7 @@
 include "mlir/IR/OpBase.td"
 
 def NeptuneIR_Dialect : Dialect {
-  let name = "neptune_ir";
+  let name = "neptune";
   let cppNamespace = "::mlir::Neptune::NeptuneIR";
   let summary = "NeptuneIR expression dialect for stencil-like PDE kernels";
   let useDefaultTypePrinterParser = true;
