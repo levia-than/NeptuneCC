@@ -2,17 +2,17 @@
 set -euo pipefail
 
 # ---- Update these paths for your local build ----
-NEPTUNE_OPT=${NEPTUNE_OPT:-/home/wyx/project/neptune-pde-solver/build/project-build/bin/neptune-opt}
-MLIR_TRANSLATE=${MLIR_TRANSLATE:-/home/wyx/project/neptune-pde-solver/build/llvm-build/bin/mlir-translate}
-LLVM_AS=${LLVM_AS:-/home/wyx/project/neptune-pde-solver/build/llvm-build/bin/llvm-as}
-LLC=${LLC:-/home/wyx/project/neptune-pde-solver/build/llvm-build/bin/llc}
+NEPTUNE_OPT=${NEPTUNE_OPT:-/home/wyx/project/NeptuneCC/build/project-build/bin/neptune-opt}
+MLIR_TRANSLATE=${MLIR_TRANSLATE:-/home/wyx/project/NeptuneCC/build/llvm-build/bin/mlir-translate}
+LLVM_AS=${LLVM_AS:-/home/wyx/project/NeptuneCC/build/llvm-build/bin/llvm-as}
+LLC=${LLC:-/home/wyx/project/NeptuneCC/build/llvm-build/bin/llc}
 CLANG=${CLANG:-clang++}
 
 # Runtime shared library
-RUNTIME_SO=${RUNTIME_SO:-/home/wyx/project/neptune-pde-solver/build/project-build/lib/Runtime/PETSc/libNeptunePETScRuntime.so}
+RUNTIME_SO=${RUNTIME_SO:-/home/wyx/project/NeptuneCC/build/project-build/lib/Runtime/PETSc/libNeptunePETScRuntime.so}
 
 # Input MLIR
-INPUT_MLIR=${1:-/home/wyx/project/neptune-pde-solver/test/smoke_tests/smoke_time_advance_nonlinear.mlir}
+INPUT_MLIR=${1:-/home/wyx/project/NeptuneCC/test/smoke_tests/smoke_time_advance_nonlinear.mlir}
 
 WORKDIR=${WORKDIR:-/tmp/neptune_smoke_time_advance_nonlinear}
 mkdir -p "$WORKDIR"

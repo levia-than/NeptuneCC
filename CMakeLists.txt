@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(NeptuneSolver LANGUAGES CXX C)
+project(NeptuneCC LANGUAGES CXX C)
 
 list(PREPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/Modules")
 

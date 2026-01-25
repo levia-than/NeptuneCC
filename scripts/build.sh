@@ -77,33 +77,34 @@ if command -v clang >/dev/null 2>&1; then
     RAW_CXX="clang++"
 fi
 
-# 启用 CCACHE (劫持编译器变量)
-# 这是确保所有子进程(包括 PETSc configure)都能用上 ccache 的最强手段
+# 启用 CCACHE (仅作为 Launcher，避免 CC/CXX 带空格干扰 CMake)
 USE_CCACHE=OFF
+CCACHE_BIN=""
 if command -v ccache >/dev/null 2>&1; then
     USE_CCACHE=ON
-    log "Enabling ccache globally..."
-    
+    CCACHE_BIN="ccache"
+    log "Enabling ccache..."
+
     # 设置 CMake Launcher (给 CMake 项目用)
     CMAKE_CCACHE_ARGS=(
-        "-DCMAKE_C_COMPILER_LAUNCHER=ccache"
-        "-DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
+        "-DCMAKE_C_COMPILER_LAUNCHER=${CCACHE_BIN}"
+        "-DCMAKE_CXX_COMPILER_LAUNCHER=${CCACHE_BIN}"
     )
-    
-    # 设置 Shell 变量 (给 configure 脚本用)
-    export CC="ccache ${RAW_CC}"
-    export CXX="ccache ${RAW_CXX}"
 else
     CMAKE_CCACHE_ARGS=()
-    export CC="${RAW_CC}"
-    export CXX="${RAW_CXX}"
 fi
+
+# 显式指定 CMake 编译器，避免被 CC/CXX 或 ccache 误识别
+CMAKE_COMPILER_ARGS=(
+    "-DCMAKE_C_COMPILER=${RAW_CC}"
+    "-DCMAKE_CXX_COMPILER=${RAW_CXX}"
+)
 
 # 检测 LLD
 USE_LLD=OFF
 if command -v lld >/dev/null 2>&1; then USE_LLD=ON; fi
 
-log "Compiler: ${CC} / ${CXX}"
+log "Compiler: ${RAW_CC} / ${RAW_CXX}"
 log "Jobs: ${NINJA_JOBS}, Linker: lld=${USE_LLD}"
 
 # ==============================================================================
@@ -130,8 +131,9 @@ build_llvm() {
         -DLLVM_TARGETS_TO_BUILD="${LLVM_TARGETS}" \
         -DLLVM_ENABLE_ASSERTIONS=ON \
         -DLLVM_ENABLE_LLD="${USE_LLD}" \
-        -DLLVM_CCACHE_BUILD=ON \
+        -DLLVM_CCACHE_BUILD="${USE_CCACHE}" \
         -DLLVM_INCLUDE_TESTS=OFF \
+        "${CMAKE_COMPILER_ARGS[@]}" \
         "${CMAKE_CCACHE_ARGS[@]}"
 
     cmake --build "${LLVM_BUILD_DIR}" --target install -j"${NINJA_JOBS}"
@@ -144,7 +146,7 @@ setup_petsc() {
     if [ "$ENABLE_PETSC" != "ON" ]; then return; fi
 
     if [ -z "${PETSC_DIR}" ]; then
-        local PETSC_VERSION="v3.20.6"
+        local PETSC_VERSION="v3.24.3"
         local PETSC_SRC="${BUILD_ROOT}/petsc-src"
         local PETSC_INSTALL="${BUILD_ROOT}/petsc-install"
 
@@ -162,12 +164,17 @@ setup_petsc() {
 
         pushd "${PETSC_SRC}" > /dev/null
         
-        # 因为我们在脚本开头已经 export CC="ccache clang"
-        # 所以这里直接传 $CC 就行了，PETSc 会识别带空格的编译器命令
+        local PETSC_CC="${RAW_CC}"
+        local PETSC_CXX="${RAW_CXX}"
+        if [ "${USE_CCACHE}" = "ON" ]; then
+            PETSC_CC="${CCACHE_BIN} ${RAW_CC}"
+            PETSC_CXX="${CCACHE_BIN} ${RAW_CXX}"
+        fi
+
         ./configure \
             --prefix="${PETSC_INSTALL}" \
-            --with-cc="${CC}" \
-            --with-cxx="${CXX}" \
+            --with-cc="${PETSC_CC}" \
+            --with-cxx="${PETSC_CXX}" \
             --with-fc=0 \
             --download-mpich=1 \
             --with-debugging=0 \
@@ -200,6 +207,7 @@ build_neptune() {
         "-DLLVM_DIR=${LLVM_INSTALL_DIR}/lib/cmake/llvm"
         "-DLLVM_EXTERNAL_LIT=${LLVM_BUILD_DIR}/bin/llvm-lit"
         "-DNEPTUNE_ENABLE_PETSC=${ENABLE_PETSC}"
+        "${CMAKE_COMPILER_ARGS[@]}"
         "${CMAKE_CCACHE_ARGS[@]}" # 自动加上 launcher
     )
 

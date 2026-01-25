@@ -2,17 +2,17 @@
 set -euo pipefail
 
 # ---- 你需要按自己 build 目录改一下这几个路径 ----
-NEPTUNE_OPT=${NEPTUNE_OPT:-/home/wyx/project/neptune-pde-solver/build/project-build/bin/neptune-opt}
-MLIR_TRANSLATE=${MLIR_TRANSLATE:-/home/wyx/project/neptune-pde-solver/build/llvm-build/bin/mlir-translate}
-LLVM_AS=${LLVM_AS:-/home/wyx/project/neptune-pde-solver/build/llvm-build/bin/llvm-as}
-LLC=${LLC:-/home/wyx/project/neptune-pde-solver/build/llvm-build/bin/llc}
+NEPTUNE_OPT=${NEPTUNE_OPT:-/home/wyx/project/NeptuneCC/build/project-build/bin/neptune-opt}
+MLIR_TRANSLATE=${MLIR_TRANSLATE:-/home/wyx/project/NeptuneCC/build/llvm-build/bin/mlir-translate}
+LLVM_AS=${LLVM_AS:-/home/wyx/project/NeptuneCC/build/llvm-build/bin/llvm-as}
+LLC=${LLC:-/home/wyx/project/NeptuneCC/build/llvm-build/bin/llc}
 CLANG=${CLANG:-clang++}
 
 # 你的 runtime so
-RUNTIME_SO=${RUNTIME_SO:-/home/wyx/project/neptune-pde-solver/build/project-build/lib/Runtime/PETSc/libNeptunePETScRuntime.so}
+RUNTIME_SO=${RUNTIME_SO:-/home/wyx/project/NeptuneCC/build/project-build/lib/Runtime/PETSc/libNeptunePETScRuntime.so}
 
 # 你的测试 mlir（用你已经能跑通 lowering 的那个）
-INPUT_MLIR=${1:-/home/wyx/project/neptune-pde-solver/test/smoke_tests/smoke_assemble_matrix.mlir}
+INPUT_MLIR=${1:-/home/wyx/project/NeptuneCC/test/smoke_tests/smoke_assemble_matrix.mlir}
 
 WORKDIR=${WORKDIR:-/tmp/neptune_smoke_assemble_matrix}
 mkdir -p "$WORKDIR"

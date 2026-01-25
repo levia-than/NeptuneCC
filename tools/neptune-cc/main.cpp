@@ -1,5 +1,6 @@
 #include "Frontend/Clang/NeptuneBinder.h"
 #include "Frontend/Clang/NeptuneManifest.h"
+#include "Frontend/Clang/NeptuneMLIRGen.h"
 #include "Frontend/Clang/NeptunePragma.h"
 
 #include "clang/AST/ASTConsumer.h"
@@ -32,6 +33,7 @@ public:
   void HandleTranslationUnit(clang::ASTContext &Ctx) override {
     neptune::pairKernels(localDb, Ctx.getDiagnostics());
     neptune::bindKernelsToBlocks(localDb, Ctx);
+    neptune::lowerKernelsToMLIR(localDb, Ctx, outDb);
     outDb.kernels.append(localDb.kernels.begin(), localDb.kernels.end());
   }
 

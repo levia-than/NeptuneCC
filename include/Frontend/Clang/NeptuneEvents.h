@@ -1,7 +1,11 @@
 #pragma once
-#include "llvm/ADT/SmallVector.h"
-#include "llvm/ADT/SmallString.h"
 #include "clang/Basic/SourceLocation.h"
+#include "llvm/ADT/SmallString.h"
+#include "llvm/ADT/SmallVector.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/MLIRContext.h"
+#include "mlir/IR/OwningOpRef.h"
+#include <memory>
 
 namespace neptune {
 
@@ -34,6 +38,8 @@ struct KernelInterval {
 struct EventDB {
   llvm::SmallVector<Event, 32> events;
   llvm::SmallVector<KernelInterval, 16> kernels;
+  std::unique_ptr<mlir::MLIRContext> mlirContext;
+  mlir::OwningOpRef<mlir::ModuleOp> kernelModule;
 };
 
 } // namespace neptune

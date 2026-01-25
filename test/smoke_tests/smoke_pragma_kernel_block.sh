@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-NEPTUNE_CC=${NEPTUNE_CC:-/home/wyx/project/neptune-pde-solver/build/project-build/bin/neptune-cc}
-INPUT_FILE=${1:-/home/wyx/project/neptune-pde-solver/test/smoke_tests/pragma_kernel_block.cpp}
+NEPTUNE_CC=${NEPTUNE_CC:-/home/wyx/project/NeptuneCC/build/project-build/tools/neptune-cc/neptune-cc}
+if [ ! -x "$NEPTUNE_CC" ]; then
+  NEPTUNE_CC=/home/wyx/project/NeptuneCC/build/project-build/bin/neptune-cc
+fi
+INPUT_FILE=${1:-/home/wyx/project/NeptuneCC/test/smoke_tests/pragma_kernel_block.cpp}
 
 WORKDIR=${WORKDIR:-/tmp/neptune_pragma_smoke}
 OUTDIR="$WORKDIR/out"
@@ -37,3 +40,20 @@ be = k0.get("block_end_offset", 0)
 assert bb != 0 and be != 0, "block offsets"
 assert pb <= bb <= be <= pe, "block within pragma range"
 PY
+
+KERNELS="$OUTDIR/kernels.mlir"
+test -f "$KERNELS"
+grep -Eq 'func.func @k0\(%arg0: memref<8xi32>, %arg1: memref<8xi32>, %arg2: memref<4x4xi32>, %arg3: memref<4x4xi32>\)' "$KERNELS"
+test "$(grep -c "scf.for" "$KERNELS" || true)" -ge 2
+grep -q "memref.load" "$KERNELS"
+grep -q "memref.store" "$KERNELS"
+! grep -q "memref.alloca" "$KERNELS"
+! grep -Eq 'scf\.for .*neptunecc\.' "$KERNELS"
+grep -q 'neptunecc.tag = "k0"' "$KERNELS"
+grep -q 'neptunecc.dm = "da"' "$KERNELS"
+grep -q 'neptunecc.block_begin_offset' "$KERNELS"
+grep -q 'neptunecc.port_map' "$KERNELS"
+grep -q 'a=in0:ghosted:arg0' "$KERNELS"
+grep -q 'x=in1:ghosted:arg2' "$KERNELS"
+grep -q 'b=out0:owned:arg1' "$KERNELS"
+grep -q 'y=out1:owned:arg3' "$KERNELS"

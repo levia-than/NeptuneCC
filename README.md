@@ -3,71 +3,83 @@
  * @Date: 2025-09-08 20:34:11
  * @LastEditors: leviathan 670916484@qq.com
  * @LastEditTime: 2025-11-09 10:33:05
- * @FilePath: /neptune-pde-solver/README.md
+ * @FilePath: /NeptuneCC/README.md
  * @Description: 
  * 
  * Copyright (c) 2025 by ${git_name_email}, All Rights Reserved. 
 -->
-# Neptune pde solver
+# NeptuneCC PDE solver
+
+NeptuneCC is an MLIR/LLVM toolchain for stencil/PDE kernels. It ships the
+NeptuneIR dialect and passes, the `neptune-opt` driver, and the `neptune-cc`
+Clang frontend for `#pragma neptune`. Runtime integration is currently out of
+tree.
+
+## Build
 
 ```bash
-git submodule update --init
+# Optionally pin LLVM via submodule (build.sh can also clone it).
+git submodule update --init --recursive
+
+# Build LLVM + Neptune
 bash scripts/build.sh
 
-# enable PETSc (optional)
-NEPTUNE_ENABLE_PETSC=ON PETSC_DIR=/path/to/petsc PETSC_ARCH=arch-name bash scripts/build.sh
-# or use CLI flags:
-# ./scripts/build.sh --enable-petsc --petsc-dir /path/to/petsc --petsc-arch arch-name
+# Common options
+bash scripts/build.sh --project-debug
+bash scripts/build.sh --rebuild-llvm
+bash scripts/build.sh --clean
+
 ```
 
-`bash scripts/build.sh -c` (or `--clean`) will remove everything under the
-centralized `build/` root. `neptune-opt` is installed to
-`build/project-build/bin/neptune-opt`.
+Artifacts land under `build/`:
+- `build/llvm-install` (LLVM/MLIR tools)
+- `build/project-build/bin/neptune-opt`
+- `build/project-build/bin/neptune-cc`
 
-## basic arch
-`lib` directory would contain all mlir-related library.
-`src` directory would export some opt tools for the sake of testing.
-`include` would contain all tablegen files.
+The build script symlinks `compile_commands.json` to the repo root and runs
+`check-neptune` after installing the tools.
+
+## Project layout
+- `include/`: tablegen + public headers (dialect, passes, frontend, utils)
+- `lib/`: implementations of the dialect, passes, frontend, and pipeline
+- `tools/`: `neptune-opt`, `neptune-cc`
+- `test/`: lit tests and smoke scripts
+- `third_party/llvm-project`: LLVM/MLIR (submodule or cloned by `build.sh`)
 
 ## NeptuneIR snapshot
-- Types: `!neptune_ir.field<element=?, bounds=?, location=?>` for storage-backed
-  fields, `!neptune_ir.temp<...>` for value-semantics temporaries.
-- Attributes: `#neptune_ir.bounds<lb=[...], ub=[...]>` for iteration domains,
-  `#neptune_ir.location<"...">` for where data lives on the mesh, optional
-  `#neptune_ir.stencil_shape<[[...], ...]>` to mark neighbor offsets.
-- Core ops: `wrap`/`unwrap` bridge buffers, `load`/`store` move between field
-  and temp, `apply` hosts the stencil body and yields scalars via `yield`,
-  neighbor reads use `access`.
+- Types: `!neptune.field<element=?, bounds=?, location=?, layout=?>` for
+  storage-backed fields, `!neptune.temp<...>` for value-semantics temporaries.
+- Attributes: `#neptune.bounds<lb=[...], ub=[...]>`, `#neptune.location<"...">`,
+  `#neptune.layout<order="...", strides=[...], halo=[...], offset=[...]>`,
+  optional `#neptune.stencil_shape<[[...], ...]>`.
+- Core ops: `neptune.ir.wrap`/`neptune.ir.unwrap`, `neptune.ir.load`/`store`,
+  `neptune.ir.apply` + `neptune.ir.access` + `neptune.ir.yield`, `neptune.ir.reduce`.
+- Passes: `neptune-ir-verify-forms`, `neptune-ir-normalize-apply`,
+  `neptune-ir-split-domain`, `neptune-ir-emitc-halide`.
 
-## basic usage
+Note: some legacy smoke inputs still use the `neptune_ir` namespace, while the
+newer syntax uses the `neptune` dialect (see `test/smoke_tests/smoke_emitC_for_apply.mlir`).
+
+## Basic usage
 ```bash
-./build/project-build/bin/neptune-opt docs/test.mlir \
-  --pass-pipeline='builtin.module(neptuneir-to-llvm)' \
-  -o lower.mlir
+./build/project-build/bin/neptune-opt test/smoke_tests/smoke_emitC_for_apply.mlir \
+  --neptune-ir-verify-forms --neptune-ir-normalize-apply -o normalized.mlir
+
+./build/project-build/bin/neptune-opt test/smoke_tests/smoke_emitC_for_apply.mlir \
+  --neptune-ir-emitc-halide -o emitc.mlir
 ```
 
+The `neptuneir-to-llvm` pipeline is registered in `neptune-opt` for LLVM
+lowering experiments.
+
+For the Clang frontend:
 ```bash
-./build/llvm-install/bin/mlir-translate --mlir-to-llvmir lower.mlir -o lower.ll
+./build/project-build/bin/neptune-cc test/smoke_tests/pragma_kernel_block.cpp \
+  --out-dir /tmp/neptune_out
+
+# If compile_commands.json is not in the repo root:
+./build/project-build/bin/neptune-cc -p build/project-build \
+  test/smoke_tests/pragma_kernel_block.cpp --out-dir /tmp/neptune_out
 ```
 
-```bash
-./build/llvm-install/bin/llc -filetype=obj lower.ll -o lower.o
-```
-
-To debug individual lowering steps, you can also drive passes manually, e.g.:
-
-```bash
-./build/project-build/bin/neptune-opt \
-  test/mlir_tests/conversion_tests/apply-2d-5pt.mlir \
-  --normalize-neptune-ir-storage --neptune-ir-stencil-to-scf
-```
-
-## front-ends and runtime
-`lib/Codegen` / `lib/Utils` are currently stubs; only the C++/MLIR pipeline and
-`neptune-opt` driver are built. AOT runners are planned but not shipped yet.
-
-## PETSc integration
-- Enable at configure time with `-DNEPTUNE_ENABLE_PETSC=ON` (or `--enable-petsc` for `scripts/build.sh`).
-- If `PETSC_DIR` points to an install prefix (or use `-DCMAKE_PREFIX_PATH=/path/to/petsc-install`), CMake will find it via `FindPETSc.cmake`. The build script still bootstraps into `build/petsc-install` if nothing is provided.
-- Override paths via `PETSC_SRC_DIR`/`PETSC_INSTALL_DIR` env vars if you don't want to use `build/`.
-- When enabled, link PETSc consumers against `PETSc::PETSc` (imported target from the find module). A small smoke binary `petsc_smoke` is built to validate the linkage.
+`neptune-cc` writes a `manifest.json` under the chosen output directory.

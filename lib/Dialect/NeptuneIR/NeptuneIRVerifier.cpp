@@ -3,7 +3,7 @@
  * @Date: 2025-11-29 11:41:01
  * @LastEditors: leviathan 670916484@qq.com
  * @LastEditTime: 2025-11-29 11:48:09
- * @FilePath: /neptune-pde-solver/lib/Dialect/NeptuneIR/NeptuneIRVerifier.cpp
+ * @FilePath: /NeptuneCC/lib/Dialect/NeptuneIR/NeptuneIRVerifier.cpp
  * @Description:
  *
  * Copyright (c) 2025 by leviathan, All Rights Reserved.

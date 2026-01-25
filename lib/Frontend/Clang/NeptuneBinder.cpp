@@ -123,6 +123,7 @@ void bindKernelsToBlocks(EventDB &db, clang::ASTContext &Ctx) {
 
   for (auto &kernel : db.kernels) {
     BlockInfo *best = nullptr;
+    unsigned bestBegin = std::numeric_limits<unsigned>::max();
     uint64_t bestRange = std::numeric_limits<uint64_t>::max();
     for (auto &block : blocks) {
       if (block.beginOffset < kernel.begin.fileOffset) {
@@ -132,7 +133,9 @@ void bindKernelsToBlocks(EventDB &db, clang::ASTContext &Ctx) {
         continue;
       }
       uint64_t range = block.endOffset - block.beginOffset;
-      if (range < bestRange) {
+      if (!best || block.beginOffset < bestBegin ||
+          (block.beginOffset == bestBegin && range < bestRange)) {
+        bestBegin = block.beginOffset;
         bestRange = range;
         best = &block;
       }
