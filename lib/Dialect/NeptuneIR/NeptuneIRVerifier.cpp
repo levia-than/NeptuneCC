@@ -296,11 +296,28 @@ LogicalResult ApplyOp::verify() {
   }
 
   Block &body = getBody().front();
-  if (body.getNumArguments() != rank)
-    return emitOpError("apply region must have ") << rank << " index arguments";
-  for (unsigned d = 0; d < rank; ++d) {
-    if (!body.getArgument(d).getType().isIndex())
-      return emitOpError("region arg #") << d << " must be index";
+  bool tempArgsOk = body.getNumArguments() == getInputs().size();
+  if (tempArgsOk) {
+    for (unsigned d = 0; d < body.getNumArguments(); ++d) {
+      auto argTy = dyn_cast<TempType>(body.getArgument(d).getType());
+      if (!argTy)
+        tempArgsOk = false;
+      else if (argTy != firstInputTy)
+        tempArgsOk = false;
+    }
+  }
+
+  bool indexArgsOk = body.getNumArguments() == rank;
+  if (indexArgsOk) {
+    for (unsigned d = 0; d < rank; ++d) {
+      if (!body.getArgument(d).getType().isIndex())
+        indexArgsOk = false;
+    }
+  }
+
+  if (!tempArgsOk && !indexArgsOk) {
+    return emitOpError("apply region must have temp arguments matching inputs "
+                       "or index arguments matching bounds rank");
   }
 
   if (radiusOpt) {

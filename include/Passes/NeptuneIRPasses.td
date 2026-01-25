@@ -51,4 +51,15 @@ def NeptuneIREmitCHalidePass
   ];
 }
 
+def SCFToNeptuneIRPass : Pass<"neptunecc-scf-to-neptuneir", "mlir::func::FuncOp"> {
+  let summary = "extract 2D 5-point scf.for stencils into neptune.ir.apply";
+  let dependentDialects = [
+    "mlir::func::FuncDialect",
+    "mlir::scf::SCFDialect",
+    "mlir::arith::ArithDialect",
+    "mlir::memref::MemRefDialect",
+    "Neptune::NeptuneIR::NeptuneIRDialect"
+  ];
+}
+
 #endif // NEPTUNEIR_PASSES_TD
