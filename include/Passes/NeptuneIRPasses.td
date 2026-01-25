@@ -46,8 +46,8 @@ def NeptuneIREmitCHalidePass
 
   let options = [
     Option<"outFile", "out-file", "std::string",
-           /*default=*/"\"neptune_kernels_generators.cpp\"",
-           "emitc output filename for generated halide generators">
+           /*default=*/"\"halide_kernels\"",
+           "emitc file id for generated halide generators">
   ];
 }
 
