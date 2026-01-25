@@ -1,4 +1,4 @@
-// RUN: neptune-opt %s -neptunecc-scf-to-neptuneir | FileCheck %s
+// RUN: neptune-opt %s -neptuneir-scf-to-neptuneir | FileCheck %s
 
 func.func @k0(%arg0: memref<4x4xi32>, %arg1: memref<4x4xi32>) {
   %c1 = arith.constant 1 : index

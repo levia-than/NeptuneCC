@@ -54,8 +54,8 @@ The build script symlinks `compile_commands.json` to the repo root and runs
   optional `#neptune.stencil_shape<[[...], ...]>`.
 - Core ops: `neptune.ir.wrap`/`neptune.ir.unwrap`, `neptune.ir.load`/`store`,
   `neptune.ir.apply` + `neptune.ir.access` + `neptune.ir.yield`, `neptune.ir.reduce`.
-- Passes: `neptune-ir-verify-forms`, `neptune-ir-normalize-apply`,
-  `neptune-ir-split-domain`, `neptune-ir-emitc-halide`.
+- Passes: `neptuneir-verify-forms`, `neptuneir-normalize-apply`,
+  `neptuneir-split-domain`, `neptuneir-emitc-halide`.
 
 Note: some legacy smoke inputs still use the `neptune_ir` namespace, while the
 newer syntax uses the `neptune` dialect (see `test/smoke_tests/smoke_emitC_for_apply.mlir`).
@@ -63,10 +63,10 @@ newer syntax uses the `neptune` dialect (see `test/smoke_tests/smoke_emitC_for_a
 ## Basic usage
 ```bash
 ./build/project-build/bin/neptune-opt test/smoke_tests/smoke_emitC_for_apply.mlir \
-  --neptune-ir-verify-forms --neptune-ir-normalize-apply -o normalized.mlir
+  --neptuneir-verify-forms --neptuneir-normalize-apply -o normalized.mlir
 
 ./build/project-build/bin/neptune-opt test/smoke_tests/smoke_emitC_for_apply.mlir \
-  --neptune-ir-emitc-halide -o emitc.mlir
+  --neptuneir-emitc-halide -o emitc.mlir
 ```
 
 The `neptuneir-to-llvm` pipeline is registered in `neptune-opt` for LLVM
