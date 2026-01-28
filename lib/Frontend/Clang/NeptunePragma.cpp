@@ -59,6 +59,7 @@ void NeptunePragmaHandler::HandlePragma(Preprocessor &PP,
 
   event.loc = FirstToken.getLocation();
   event.fileOffset = SM.getFileOffset(SM.getExpansionLoc(event.loc));
+  event.filePath = SM.getFilename(SM.getExpansionLoc(event.loc));
 
   bool reachedEOD = false;
   while (!reachedEOD) {

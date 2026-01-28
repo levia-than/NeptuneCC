@@ -8,9 +8,10 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
 
-#include "llvm/ADT/SmallString.h"
+#include "llvm/ADT/APFloat.h"
+#include "llvm/ADT/APInt.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
-#include "llvm/Support/raw_ostream.h"
 
 using namespace mlir;
 
@@ -22,251 +23,460 @@ namespace mlir::Neptune::NeptuneIR {
 namespace {
 using namespace mlir::Neptune::NeptuneIR;
 
-static StringRef dimName(int64_t d) {
-  static const char *names[] = {"x", "y", "z", "w"};
-  return names[d];
-}
-
 static Type getOpaque(MLIRContext *ctx, StringRef spelling) {
   return emitc::OpaqueType::get(ctx, spelling);
 }
 
-static Type getConstCharPtr(MLIRContext *ctx) {
-  // !emitc.ptr<!emitc.opaque<"const char">>
-  Type cchar = emitc::OpaqueType::get(ctx, "const char");
-  return emitc::PointerType::get(cchar);
-}
-
 static Value constI32(OpBuilder &b, Location loc, int32_t v) {
-  auto ty = b.getI32Type();
-  return b.create<emitc::ConstantOp>(loc, ty, b.getI32IntegerAttr(v));
+  return b.create<emitc::ConstantOp>(loc, b.getI32Type(),
+                                     b.getI32IntegerAttr(v));
 }
 
-static void emitVerbatim(OpBuilder &b, Location loc, StringRef text,
-                         ValueRange args = {}) {
-  // emitc.verbatim "..." (args %a, %b, ...)
-  b.create<emitc::VerbatimOp>(loc, b.getStringAttr(text), args);
+static emitc::CallOpaqueOp buildInvoke(OpBuilder &b, Location loc,
+                                       TypeRange resultTypes,
+                                       ValueRange operands) {
+  return b.create<emitc::CallOpaqueOp>(loc, resultTypes, "std::invoke",
+                                       operands);
 }
 
-static Value buildCStringLiteral(OpBuilder &b, Location loc,
-                                 llvm::StringRef s) {
+static bool isOpaqueType(Type type, StringRef spelling) {
+  if (auto opaque = dyn_cast<emitc::OpaqueType>(type))
+    return opaque.getValue() == spelling;
+  return false;
+}
+
+static bool isHalideExprOrVar(Type type) {
+  return isOpaqueType(type, "Halide::Expr") ||
+         isOpaqueType(type, "Halide::Var");
+}
+
+static void appendInt(llvm::SmallVectorImpl<char> &storage, int64_t value) {
+  if (value == 0) {
+    storage.push_back('0');
+    return;
+  }
+  if (value < 0) {
+    storage.push_back('-');
+    value = -value;
+  }
+  char buf[32];
+  int len = 0;
+  while (value > 0) {
+    buf[len++] = static_cast<char>('0' + (value % 10));
+    value /= 10;
+  }
+  for (int i = len - 1; i >= 0; --i)
+    storage.push_back(buf[i]);
+}
+
+static Value buildCStringLiteral(OpBuilder &b, Location loc, StringRef text) {
   MLIRContext *ctx = b.getContext();
-  auto ccharTy = emitc::OpaqueType::get(ctx, "const char");
-  auto cstrTy = emitc::PointerType::get(
-      ccharTy); // !emitc.ptr<!emitc.opaque<"const char">>
+  Type ccharTy = getOpaque(ctx, "const char");
+  Type cstrTy = emitc::PointerType::get(ccharTy);
 
-  llvm::SmallString<128> quoted;
-  quoted.push_back('"');
-  quoted.append(s);
-  quoted.push_back('"');
+  llvm::SmallVector<char, 64> storage;
+  storage.push_back('"');
+  storage.append(text.begin(), text.end());
+  storage.push_back('"');
 
+  StringRef quoted(storage.data(), storage.size());
   return b.create<emitc::LiteralOp>(loc, cstrTy, b.getStringAttr(quoted));
 }
 
-struct HalideExprMVP {
-  AccessOp access;
-  FloatAttr addConst; // null if absent
+static Value buildIndexedCStringLiteral(OpBuilder &b, Location loc,
+                                        StringRef prefix, int64_t index) {
+  MLIRContext *ctx = b.getContext();
+  Type ccharTy = getOpaque(ctx, "const char");
+  Type cstrTy = emitc::PointerType::get(ccharTy);
+
+  llvm::SmallVector<char, 64> storage;
+  storage.push_back('"');
+  storage.append(prefix.begin(), prefix.end());
+  appendInt(storage, index);
+  storage.push_back('"');
+
+  StringRef quoted(storage.data(), storage.size());
+  return b.create<emitc::LiteralOp>(loc, cstrTy, b.getStringAttr(quoted));
+}
+
+static Value buildIntLiteral(OpBuilder &b, Location loc, int64_t value) {
+  MLIRContext *ctx = b.getContext();
+  Type intTy = getOpaque(ctx, "int");
+  llvm::SmallVector<char, 32> storage;
+  appendInt(storage, value);
+  StringRef literal(storage.data(), storage.size());
+  return b.create<emitc::LiteralOp>(loc, intTy, b.getStringAttr(literal));
+}
+
+struct ExprEmitter {
+  ExprEmitter(OpBuilder &b, Location loc, Type exprTy,
+              DenseMap<Value, Value> &inputToImage, Value xVar, Value yVar)
+      : b(b), loc(loc), exprTy(exprTy), inputToImage(inputToImage), xVar(xVar),
+        yVar(yVar) {}
+
+  FailureOr<Value> emit(Value v) {
+    auto it = cache.find(v);
+    if (it != cache.end())
+      return it->second;
+
+    if (auto acc = v.getDefiningOp<AccessOp>()) {
+      auto res = emitAccess(acc);
+      if (failed(res))
+        return failure();
+      cache[v] = *res;
+      return *res;
+    }
+    if (auto cst = v.getDefiningOp<arith::ConstantOp>()) {
+      auto res = emitConstant(cst);
+      if (failed(res))
+        return failure();
+      cache[v] = *res;
+      return *res;
+    }
+    if (auto addi = v.getDefiningOp<arith::AddIOp>()) {
+      auto res = emitBinary(addi.getLhs(), addi.getRhs(),
+                            [&](Value l, Value r) {
+                              return b.create<emitc::AddOp>(loc, exprTy, l, r);
+                            });
+      if (failed(res))
+        return failure();
+      cache[v] = *res;
+      return *res;
+    }
+    if (auto addf = v.getDefiningOp<arith::AddFOp>()) {
+      auto res = emitBinary(addf.getLhs(), addf.getRhs(),
+                            [&](Value l, Value r) {
+                              return b.create<emitc::AddOp>(loc, exprTy, l, r);
+                            });
+      if (failed(res))
+        return failure();
+      cache[v] = *res;
+      return *res;
+    }
+    if (auto subi = v.getDefiningOp<arith::SubIOp>()) {
+      auto res = emitBinary(subi.getLhs(), subi.getRhs(),
+                            [&](Value l, Value r) {
+                              return b.create<emitc::SubOp>(loc, exprTy, l, r);
+                            });
+      if (failed(res))
+        return failure();
+      cache[v] = *res;
+      return *res;
+    }
+    if (auto subf = v.getDefiningOp<arith::SubFOp>()) {
+      auto res = emitBinary(subf.getLhs(), subf.getRhs(),
+                            [&](Value l, Value r) {
+                              return b.create<emitc::SubOp>(loc, exprTy, l, r);
+                            });
+      if (failed(res))
+        return failure();
+      cache[v] = *res;
+      return *res;
+    }
+    if (auto muli = v.getDefiningOp<arith::MulIOp>()) {
+      auto res = emitBinary(muli.getLhs(), muli.getRhs(),
+                            [&](Value l, Value r) {
+                              return b.create<emitc::MulOp>(loc, exprTy, l, r);
+                            });
+      if (failed(res))
+        return failure();
+      cache[v] = *res;
+      return *res;
+    }
+    if (auto mulf = v.getDefiningOp<arith::MulFOp>()) {
+      auto res = emitBinary(mulf.getLhs(), mulf.getRhs(),
+                            [&](Value l, Value r) {
+                              return b.create<emitc::MulOp>(loc, exprTy, l, r);
+                            });
+      if (failed(res))
+        return failure();
+      cache[v] = *res;
+      return *res;
+    }
+    if (auto divi = v.getDefiningOp<arith::DivSIOp>()) {
+      auto res = emitBinary(divi.getLhs(), divi.getRhs(),
+                            [&](Value l, Value r) {
+                              return b.create<emitc::DivOp>(loc, exprTy, l, r);
+                            });
+      if (failed(res))
+        return failure();
+      cache[v] = *res;
+      return *res;
+    }
+    if (auto divf = v.getDefiningOp<arith::DivFOp>()) {
+      auto res = emitBinary(divf.getLhs(), divf.getRhs(),
+                            [&](Value l, Value r) {
+                              return b.create<emitc::DivOp>(loc, exprTy, l, r);
+                            });
+      if (failed(res))
+        return failure();
+      cache[v] = *res;
+      return *res;
+    }
+
+    if (auto *def = v.getDefiningOp())
+      def->emitOpError("unsupported op in Halide EmitC expression");
+    else
+      emitError(loc) << "unsupported block argument in Halide expression";
+    return failure();
+  }
+
+  FailureOr<Value> emitAccess(AccessOp acc) {
+    auto it = inputToImage.find(acc.getInput());
+    if (it == inputToImage.end()) {
+      acc.emitOpError("access input is not mapped to an ImageParam");
+      return failure();
+    }
+
+    auto offsets = acc.getOffsets();
+    if (offsets.size() != 2) {
+      acc.emitOpError("only 2D access supported for Halide EmitC emission");
+      return failure();
+    }
+
+    // Halide expects dim0 to be the fastest-varying dimension (stride == 1),
+    // so map dim0 -> last IR index and dim1 -> first IR index.
+    Value ex = buildOffset(xVar, offsets[1]);
+    Value ey = buildOffset(yVar, offsets[0]);
+
+    auto call =
+        buildInvoke(b, loc, TypeRange{exprTy}, ValueRange{it->second, ex, ey});
+    return call.getResult(0);
+  }
+
+  FailureOr<Value> emitConstant(arith::ConstantOp cst) {
+    Type cstTy = cst.getType();
+    Attribute attr = cst.getValue();
+    if (auto fTy = dyn_cast<FloatType>(cstTy)) {
+      if (!fTy.isF32()) {
+        cst.emitOpError("only f32 constants supported for Halide EmitC");
+        return failure();
+      }
+      auto fAttr = dyn_cast<FloatAttr>(attr);
+      if (!fAttr) {
+        cst.emitOpError("expected float constant attribute");
+        return failure();
+      }
+      llvm::SmallVector<char, 32> storage;
+      fAttr.getValue().toString(storage, /*FormatPrecision=*/0,
+                                /*FormatMaxPadding=*/0,
+                                /*TruncateZero=*/false);
+      bool hasDotOrExp = false;
+      for (char c : storage) {
+        if (c == '.' || c == 'e' || c == 'E') {
+          hasDotOrExp = true;
+          break;
+        }
+      }
+      if (!hasDotOrExp) {
+        storage.push_back('.');
+        storage.push_back('0');
+      }
+      storage.push_back('f');
+      StringRef literal(storage.data(), storage.size());
+      auto lit =
+          b.create<emitc::LiteralOp>(loc, exprTy, b.getStringAttr(literal));
+      return lit.getResult();
+    } else if (auto iTy = dyn_cast<IntegerType>(cstTy)) {
+      if (!iTy.isInteger(32)) {
+        cst.emitOpError("only i32 constants supported for Halide EmitC");
+        return failure();
+      }
+      auto iAttr = dyn_cast<IntegerAttr>(attr);
+      if (!iAttr) {
+        cst.emitOpError("expected integer constant attribute");
+        return failure();
+      }
+      llvm::SmallVector<char, 32> storage;
+      bool isSigned = !iTy.isUnsigned();
+      iAttr.getValue().toString(storage, /*Radix=*/10, isSigned,
+                                /*formatAsCLiteral=*/false);
+      StringRef literal(storage.data(), storage.size());
+      auto lit =
+          b.create<emitc::LiteralOp>(loc, exprTy, b.getStringAttr(literal));
+      return lit.getResult();
+    } else {
+      cst.emitOpError("unsupported constant type for Halide EmitC");
+      return failure();
+    }
+  }
+
+  template <typename CreateFn>
+  FailureOr<Value> emitBinary(Value lhs, Value rhs, CreateFn createOp) {
+    auto l = emit(lhs);
+    auto r = emit(rhs);
+    if (failed(l) || failed(r))
+      return failure();
+    return createOp(*l, *r).getResult();
+  }
+
+  Value buildOffset(Value base, int64_t offset) {
+    if (offset == 0)
+      return base;
+
+    int64_t absOff = offset > 0 ? offset : -offset;
+    Value offVal = buildIntLiteral(b, loc, absOff);
+    if (isHalideExprOrVar(base.getType())) {
+      StringRef op = offset > 0 ? "Halide::operator+" : "Halide::operator-";
+      auto call =
+          b.create<emitc::CallOpaqueOp>(loc, TypeRange{exprTy}, op,
+                                        ValueRange{base, offVal});
+      return call.getResult(0);
+    }
+
+    Type resTy = base.getType();
+    if (offset > 0)
+      return b.create<emitc::AddOp>(loc, resTy, base, offVal).getResult();
+    return b.create<emitc::SubOp>(loc, resTy, base, offVal).getResult();
+  }
+
+  OpBuilder &b;
+  Location loc;
+  Type exprTy;
+  DenseMap<Value, Value> &inputToImage;
+  Value xVar;
+  Value yVar;
+  DenseMap<Value, Value> cache;
 };
 
-// MVP: yield = access(in0,[0..]) or access + const
-static FailureOr<HalideExprMVP> parseHalideExprMVP(ApplyOp apply) {
-  Block &blk = apply.getBody().front();
-  auto *term = blk.getTerminator();
-  auto y = dyn_cast_or_null<YieldOp>(term);
-  if (!y || y.getResults().size() != 1)
-    return failure();
-
-  Value v = y.getResults().front();
-  Operation *def = v.getDefiningOp();
-  if (!def)
-    return failure();
-
-  // access(...)
-  auto acc = dyn_cast<AccessOp>(def);
-  auto addf = dyn_cast<arith::AddFOp>(def);
-
-  if (acc)
-    return HalideExprMVP{acc, FloatAttr()};
-
-  if (addf) {
-    // one side must be access, other side must be constant float
-    auto a0 = addf.getLhs().getDefiningOp<AccessOp>();
-    auto a1 = addf.getRhs().getDefiningOp<AccessOp>();
-    auto c0 = addf.getLhs().getDefiningOp<arith::ConstantOp>();
-    auto c1 = addf.getRhs().getDefiningOp<arith::ConstantOp>();
-    if (a0 && c1) {
-      if (auto fa = dyn_cast<FloatAttr>(c1.getValue()))
-        return HalideExprMVP{a0, fa};
-    }
-    if (a1 && c0) {
-      if (auto fa = dyn_cast<FloatAttr>(c0.getValue()))
-        return HalideExprMVP{a1, fa};
-    }
-  }
-
-  return failure();
-}
-
-static Value buildOffsetExpr(OpBuilder &b, Location loc, Value base,
-                             int64_t offset, Type exprTy) {
-  if (offset == 0)
-    return base;
-
-  int32_t absOff = static_cast<int32_t>(offset > 0 ? offset : -offset);
-  Value offVal = constI32(b, loc, absOff);
-  if (offset > 0)
-    return b.create<emitc::AddOp>(loc, exprTy, base, offVal);
-  return b.create<emitc::SubOp>(loc, exprTy, base, offVal);
-}
-
-static void emitMemberCall(OpBuilder &b, Location loc, Value obj,
-                           StringRef method, ValueRange args) {
-  // EmitC has no direct op for member calls; use verbatim placeholders.
-  llvm::SmallString<128> fmt;
-  fmt.append("{}.");
-  fmt.append(method);
-  fmt.append("(");
-  for (int64_t i = 0, e = (int64_t)args.size(); i < e; ++i) {
-    if (i)
-      fmt.append(", ");
-    fmt.append("{}");
-  }
-  fmt.append(");");
-
-  llvm::SmallVector<Value, 8> fmtArgs;
-  fmtArgs.reserve(args.size() + 1);
-  fmtArgs.push_back(obj);
-  fmtArgs.append(args.begin(), args.end());
-  emitVerbatim(b, loc, fmt, fmtArgs);
-}
-
-static void emitFuncAssignment(OpBuilder &b, Location loc, Value func,
-                               ArrayRef<Value> lhsIdx, Value input,
-                               ArrayRef<Value> rhsIdx, Value addConst) {
-  // EmitC lacks a func-call assignment op; use verbatim placeholders.
-  llvm::SmallString<128> fmt;
-  fmt.append("{}(");
-  for (int64_t i = 0, e = (int64_t)lhsIdx.size(); i < e; ++i) {
-    if (i)
-      fmt.append(", ");
-    fmt.append("{}");
-  }
-  fmt.append(") = {}(");
-  for (int64_t i = 0, e = (int64_t)rhsIdx.size(); i < e; ++i) {
-    if (i)
-      fmt.append(", ");
-    fmt.append("{}");
-  }
-  fmt.append(")");
-
-  llvm::SmallVector<Value, 12> fmtArgs;
-  fmtArgs.reserve(lhsIdx.size() + rhsIdx.size() + 3);
-  fmtArgs.push_back(func);
-  fmtArgs.append(lhsIdx.begin(), lhsIdx.end());
-  fmtArgs.push_back(input);
-  fmtArgs.append(rhsIdx.begin(), rhsIdx.end());
-
-  if (addConst) {
-    fmt.append(" + {}");
-    fmtArgs.push_back(addConst);
-  }
-  fmt.append(";");
-  emitVerbatim(b, loc, fmt, fmtArgs);
-}
-
-static LogicalResult emitOneKernel(OpBuilder &b, Location loc, ApplyOp apply,
-                                   int kernelIndex) {
+static LogicalResult emitOneKernel(OpBuilder &b, func::FuncOp func,
+                                   ApplyOp apply) {
   MLIRContext *ctx = b.getContext();
+  Location loc = apply.getLoc();
 
-  // rank
-  auto lb = apply.getBounds().getLb().asArrayRef();
-  int64_t rank = (int64_t)lb.size();
-  if (rank < 1 || rank > 4)
+  auto bounds = apply.getBounds();
+  auto lb = bounds.getLb().asArrayRef();
+  if (lb.size() != 2) {
+    apply.emitOpError("only 2D apply supported in neptuneir-emitc-halide");
     return failure();
-
-  auto mvpOr = parseHalideExprMVP(apply);
-  if (failed(mvpOr))
-    return failure();
-  auto mvp = *mvpOr;
-
-  auto offsAttr = mvp.access.getOffsets();
-  ArrayRef<int64_t> offs = offsAttr;
-  if ((int64_t)offs.size() != rank)
-    return failure();
-
-  // kernel name: "unnamed_<k>_x<i>o1"
-  int nIn = (int)apply.getInputs().size();
-  llvm::SmallString<64> kname;
-  {
-    llvm::raw_svector_ostream os(kname);
-    os << "unnamed_" << kernelIndex << "_x" << nIn << "o1";
   }
 
-  // Halide::Type t = Halide::Float(32);
-  Value bits = constI32(b, loc, 32);
-  auto f32 = b.create<emitc::CallOpaqueOp>(loc, getOpaque(ctx, "Halide::Type"),
-                                           b.getStringAttr("Halide::Float"),
-                                           ValueRange{bits});
-
-  // dim rank
-  Value dim = constI32(b, loc, (int32_t)rank);
-
-  // ImageParam in0 (MVP: 只做 1 个输入；你后面按 nIn 循环复制即可)
-  Value inName = buildCStringLiteral(b, loc, "in0");
-  auto in0 =
-      b.create<emitc::CallOpaqueOp>(loc, getOpaque(ctx, "Halide::ImageParam"),
-                                    b.getStringAttr("Halide::ImageParam"),
-                                    ValueRange{f32->getResult(0), dim, inName});
-
-  // Func f("kernel")
-  Value fName = buildCStringLiteral(b, loc, kname);
-  auto f = b.create<emitc::CallOpaqueOp>(loc, getOpaque(ctx, "Halide::Func"),
-                                         b.getStringAttr("Halide::Func"),
-                                         ValueRange{fName});
-
-  // Vars x,y,z...
-  llvm::SmallVector<Value, 4> vars;
-  for (int64_t d = 0; d < rank; ++d) {
-    Value vn = buildCStringLiteral(b, loc, dimName(d));
-    auto v = b.create<emitc::CallOpaqueOp>(loc, getOpaque(ctx, "Halide::Var"),
-                                           b.getStringAttr("Halide::Var"),
-                                           ValueRange{vn});
-    vars.push_back(v.getResult(0));
+  auto tempTy = dyn_cast<TempType>(apply.getResult().getType());
+  if (!tempTy) {
+    apply.emitOpError("apply result is not a neptune temp type");
+    return failure();
   }
+  Type elemTy = tempTy.getElementType();
 
+  Type halideTypeTy = getOpaque(ctx, "Halide::Type");
+  Type imageParamTy = getOpaque(ctx, "Halide::ImageParam");
+  Type funcTy = getOpaque(ctx, "Halide::Func");
+  Type funcRefTy = getOpaque(ctx, "Halide::FuncRef");
+  Type varTy = getOpaque(ctx, "Halide::Var");
   Type exprTy = getOpaque(ctx, "Halide::Expr");
-  llvm::SmallVector<Value, 4> idxExprs;
-  idxExprs.reserve(rank);
-  for (int64_t d = 0; d < rank; ++d)
-    idxExprs.push_back(buildOffsetExpr(b, loc, vars[d], offs[d], exprTy));
+  Type argsTy = getOpaque(ctx, "std::vector<Halide::Argument>");
+  Type targetTy = getOpaque(ctx, "Halide::Target");
 
-  Value addConst;
-  if (mvp.addConst)
-    addConst =
-        b.create<emitc::ConstantOp>(loc, mvp.addConst.getType(), mvp.addConst);
+  Value bits = constI32(b, loc, 32);
+  Value halideElemTy;
+  if (auto fTy = dyn_cast<FloatType>(elemTy)) {
+    if (!fTy.isF32()) {
+      apply.emitOpError("only f32 element types supported for Halide EmitC");
+      return failure();
+    }
+    auto f32 = b.create<emitc::CallOpaqueOp>(
+        loc, TypeRange{halideTypeTy}, "Halide::Float", ValueRange{bits});
+    halideElemTy = f32.getResult(0);
+  } else if (auto iTy = dyn_cast<IntegerType>(elemTy)) {
+    if (!iTy.isInteger(32)) {
+      apply.emitOpError("only i32 element types supported for Halide EmitC");
+      return failure();
+    }
+    auto i32 = b.create<emitc::CallOpaqueOp>(
+        loc, TypeRange{halideTypeTy}, "Halide::Int", ValueRange{bits});
+    halideElemTy = i32.getResult(0);
+  } else {
+    apply.emitOpError("unsupported element type for Halide EmitC");
+    return failure();
+  }
 
-  emitFuncAssignment(b, loc, f->getResult(0), vars, in0->getResult(0), idxExprs,
-                     addConst);
+  Value dim = constI32(b, loc, 2);
+  StringRef kernelName = func.getSymName();
+  Value kernelNameLit = buildCStringLiteral(b, loc, kernelName);
 
-  // Target
-  auto target = b.create<emitc::CallOpaqueOp>(
-      loc, getOpaque(ctx, "Halide::Target"),
-      b.getStringAttr("Halide::get_host_target"), ValueRange{});
+  llvm::SmallVector<Value, 4> imageParams;
+  imageParams.reserve(apply.getInputs().size());
+  auto inputs = apply.getInputs();
+  for (size_t i = 0, e = inputs.size(); i < e; ++i) {
+    Value inName = buildIndexedCStringLiteral(b, loc, "in", i);
+    auto ip = b.create<emitc::CallOpaqueOp>(
+        loc, TypeRange{imageParamTy}, "Halide::ImageParam",
+        ValueRange{halideElemTy, dim, inName});
+    imageParams.push_back(ip.getResult(0));
+  }
 
-  // std::vector<Halide::Argument> args;
-  auto args = b.create<emitc::CallOpaqueOp>(
-      loc, getOpaque(ctx, "std::vector<Halide::Argument>"),
-      b.getStringAttr("std::vector<Halide::Argument>"), ValueRange{});
+  auto out =
+      b.create<emitc::CallOpaqueOp>(loc, TypeRange{funcTy}, "Halide::Func",
+                                    ValueRange{kernelNameLit});
+  Value outFunc = out.getResult(0);
 
-  // args.push_back(in0);
-  emitMemberCall(b, loc, args->getResult(0), "push_back",
-                 ValueRange{in0->getResult(0)});
+  Value xName = buildCStringLiteral(b, loc, "x");
+  Value yName = buildCStringLiteral(b, loc, "y");
+  Value xVar =
+      b.create<emitc::CallOpaqueOp>(loc, TypeRange{varTy}, "Halide::Var",
+                                    ValueRange{xName})
+          .getResult(0);
+  Value yVar =
+      b.create<emitc::CallOpaqueOp>(loc, TypeRange{varTy}, "Halide::Var",
+                                    ValueRange{yName})
+          .getResult(0);
 
-  // f.compile_to_static_library("name", args, "name", target);
-  emitMemberCall(
-      b, loc, f->getResult(0), "compile_to_static_library",
-      ValueRange{fName, args->getResult(0), fName, target->getResult(0)});
+  auto argVec =
+      b.create<emitc::CallOpaqueOp>(loc, TypeRange{argsTy},
+                                    "std::vector<Halide::Argument>",
+                                    ValueRange{});
+  Value argsVal = argVec.getResult(0);
+  for (Value ip : imageParams) {
+    b.create<emitc::CallOpaqueOp>(
+        loc, TypeRange{}, "neptune_halide::push_arg",
+        ValueRange{argsVal, ip});
+  }
 
+  auto target =
+      b.create<emitc::CallOpaqueOp>(loc, TypeRange{targetTy},
+                                    "Halide::get_host_target", ValueRange{});
+  Value targetVal = target.getResult(0);
+
+  DenseMap<Value, Value> inputToImage;
+  Block &body = apply.getBody().front();
+  auto bodyArgs = body.getArguments();
+  if (bodyArgs.size() != imageParams.size()) {
+    apply.emitOpError("apply region arguments do not match input count");
+    return failure();
+  }
+  for (size_t i = 0, e = bodyArgs.size(); i < e; ++i)
+    inputToImage[bodyArgs[i]] = imageParams[i];
+  for (size_t i = 0, e = inputs.size(); i < e; ++i)
+    inputToImage[inputs[i]] = imageParams[i];
+
+  auto *term = body.getTerminator();
+  auto yield = dyn_cast_or_null<YieldOp>(term);
+  if (!yield || yield.getResults().size() != 1) {
+    apply.emitOpError("apply region must yield exactly one value");
+    return failure();
+  }
+
+  ExprEmitter emitter(b, loc, exprTy, inputToImage, xVar, yVar);
+  FailureOr<Value> expr = emitter.emit(yield.getResults().front());
+  if (failed(expr))
+    return failure();
+
+  {
+    auto funcRefCall =
+        buildInvoke(b, loc, TypeRange{funcRefTy},
+                    ValueRange{outFunc, xVar, yVar});
+    Value funcRef = funcRefCall.getResult(0);
+    b.create<emitc::CallOpaqueOp>(
+        loc, TypeRange{}, "neptune_halide::assign",
+        ValueRange{funcRef, *expr});
+  }
+
+  {
+    b.create<emitc::CallOpaqueOp>(
+        loc, TypeRange{}, "neptune_halide::compile",
+        ValueRange{outFunc, kernelNameLit, argsVal, kernelNameLit,
+                   targetVal});
+  }
   return success();
 }
 
@@ -282,67 +492,73 @@ struct NeptuneIREmitCHalidePass final
     ModuleOp module = cast<ModuleOp>(getOperation());
     MLIRContext *ctx = module.getContext();
 
-    SmallVector<ApplyOp, 16> applies;
-    module.walk([&](ApplyOp op) { applies.push_back(op); });
-    if (applies.empty())
+    SmallVector<std::pair<func::FuncOp, ApplyOp>, 8> kernels;
+    for (func::FuncOp func : module.getOps<func::FuncOp>()) {
+      SmallVector<ApplyOp, 4> applies;
+      func.walk([&](ApplyOp op) { applies.push_back(op); });
+      if (applies.empty())
+        continue;
+      if (applies.size() != 1) {
+        func.emitOpError("multiple apply in one function not supported yet");
+        signalPassFailure();
+        return;
+      }
+      kernels.emplace_back(func, applies.front());
+    }
+
+    if (kernels.empty())
       return;
 
     OpBuilder b(ctx);
     b.setInsertionPointToEnd(module.getBody());
 
-    // emitc.file "halide_kernels"
-    const std::string &out = outFile.getValue();
-    StringRef fileId =
-        out.empty() ? StringRef("halide_kernels") : StringRef(out);
-    auto file =
-        b.create<emitc::FileOp>(module.getLoc(), b.getStringAttr(fileId));
+    StringRef fileId = outFile;
+    if (fileId.empty())
+      fileId = "halide_kernels";
 
-    // file body builder
+    auto file = b.create<emitc::FileOp>(module.getLoc(), fileId);
+
     Block *fb = file.getBody();
     OpBuilder fbld = OpBuilder::atBlockBegin(fb);
 
-    // includes
-    fbld.create<emitc::IncludeOp>(module.getLoc(), b.getStringAttr("Halide.h"),
+    fbld.create<emitc::IncludeOp>(module.getLoc(),
+                                  fbld.getStringAttr("Halide.h"),
                                   /*isStandardInclude*/ false);
-    fbld.create<emitc::IncludeOp>(module.getLoc(), b.getStringAttr("<vector>"),
-                                  /*isStandardInclude*/ false);
+    fbld.create<emitc::IncludeOp>(
+        module.getLoc(), fbld.getStringAttr("NeptuneHalideHelpers.h"),
+        /*isStandardInclude*/ false);
+    fbld.create<emitc::IncludeOp>(module.getLoc(),
+                                  fbld.getStringAttr("vector"),
+                                  /*isStandardInclude*/ true);
+    fbld.create<emitc::IncludeOp>(module.getLoc(),
+                                  fbld.getStringAttr("functional"),
+                                  /*isStandardInclude*/ true);
+    fbld.create<emitc::IncludeOp>(module.getLoc(),
+                                  fbld.getStringAttr("cstdint"),
+                                  /*isStandardInclude*/ true);
 
-    // emitc.func @neptune_build_halide_kernels()
     auto buildFn = fbld.create<emitc::FuncOp>(
-        module.getLoc(), fbld.getStringAttr("neptune_build_halide_kernels"),
+        module.getLoc(), "neptuneir_build_halide_kernels",
         FunctionType::get(ctx, /*inputs*/ {}, /*results*/ {}));
 
-    // fill buildFn body
     {
-      Block &bb = buildFn.getBody().front();
-      OpBuilder bbld = OpBuilder::atBlockBegin(&bb);
+      Block *bb = buildFn.addEntryBlock();
+      OpBuilder bbld = OpBuilder::atBlockBegin(bb);
 
-      int k = 0;
-      for (ApplyOp ap : applies) {
-        if (failed(emitOneKernel(bbld, ap.getLoc(), ap, k++))) {
-          ap.emitOpError("EmitCHalide MVP only supports: yield=access(in0,off) "
-                         "or access+const");
+      for (auto &pair : kernels) {
+        if (failed(emitOneKernel(bbld, pair.first, pair.second))) {
           signalPassFailure();
           return;
         }
       }
-      bbld.create<emitc::ReturnOp>(module.getLoc(), Value{});
+      bbld.create<emitc::ReturnOp>(module.getLoc(), Value());
     }
 
-    // emitc.func @main() -> i32
-    auto mainFn = fbld.create<emitc::FuncOp>(
-        module.getLoc(), fbld.getStringAttr("main"),
-        FunctionType::get(ctx, /*inputs*/ {}, /*results*/ {b.getI32Type()}));
-
-    {
-      Block &mb = mainFn.getBody().front();
-      OpBuilder mbld = OpBuilder::atBlockBegin(&mb);
-      auto callee = SymbolRefAttr::get(ctx, "neptune_build_halide_kernels");
-      mbld.create<emitc::CallOp>(module.getLoc(), callee, TypeRange{},
-                                 ValueRange{});
-      Value z = constI32(mbld, module.getLoc(), 0);
-      mbld.create<emitc::ReturnOp>(module.getLoc(), z);
-    }
+    // Keep only the emitc.file for downstream translation.
+    Operation *fileOp = file.getOperation();
+    fileOp->remove();
+    module.getBody()->clear();
+    module.getBody()->push_back(fileOp);
   }
 };
 

@@ -20,6 +20,7 @@ struct Event {
   EventKind kind;
   clang::SourceLocation loc;     // pragma token 位置
   unsigned fileOffset = 0;       // SM.getFileOffset(SM.getExpansionLoc(loc))
+  llvm::SmallString<256> filePath; // source file path for the pragma
   llvm::SmallString<64> tag;     // tag(...)
   llvm::SmallString<64> name;    // name(...) (optional)
   llvm::SmallVector<ClauseKV, 8> clauses; // 除 tag/name 外所有 key(value)

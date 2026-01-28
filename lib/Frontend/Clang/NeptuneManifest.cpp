@@ -87,13 +87,20 @@ static bool writeKernelsMLIR(const EventDB &db, llvm::StringRef outDir) {
   return true;
 }
 
-bool writeManifest(const EventDB &db, llvm::StringRef outDir) {
+bool writeManifest(const EventDB &db, llvm::StringRef outDir,
+                   bool emitKernelsMLIR) {
   llvm::SmallString<256> outputDir(outDir);
   std::error_code ec = llvm::sys::fs::create_directories(outputDir);
   if (ec) {
     llvm::errs() << "neptune-cc: failed to create output dir '"
                  << outputDir << "': " << ec.message() << "\n";
     return false;
+  }
+
+  if (emitKernelsMLIR) {
+    if (!writeKernelsMLIR(db, outputDir)) {
+      return false;
+    }
   }
 
   llvm::SmallString<256> outputPath(outputDir);

@@ -5,6 +5,7 @@ NEPTUNE_CC=${NEPTUNE_CC:-/home/wyx/project/NeptuneCC/build/project-build/tools/n
 if [ ! -x "$NEPTUNE_CC" ]; then
   NEPTUNE_CC=/home/wyx/project/NeptuneCC/build/project-build/bin/neptune-cc
 fi
+NEPTUNE_CC_FLAGS=${NEPTUNE_CC_FLAGS:---emit-kernels-mlir}
 INPUT_FILE=${1:-/home/wyx/project/NeptuneCC/test/smoke_tests/pragma_kernel_block.cpp}
 
 WORKDIR=${WORKDIR:-/tmp/neptune_pragma_smoke}
@@ -12,7 +13,7 @@ OUTDIR="$WORKDIR/out"
 rm -rf "$OUTDIR"
 mkdir -p "$OUTDIR"
 
-"$NEPTUNE_CC" "$INPUT_FILE" --out-dir="$OUTDIR"
+"$NEPTUNE_CC" "$INPUT_FILE" --out-dir="$OUTDIR" $NEPTUNE_CC_FLAGS
 
 MANIFEST="$OUTDIR/manifest.json"
 test -f "$MANIFEST"
@@ -57,3 +58,15 @@ grep -q 'a=in0:ghosted:arg0' "$KERNELS"
 grep -q 'x=in1:ghosted:arg2' "$KERNELS"
 grep -q 'b=out0:owned:arg1' "$KERNELS"
 grep -q 'y=out1:owned:arg3' "$KERNELS"
+
+GLUE_DIR="$OUTDIR/glue"
+test -f "$GLUE_DIR/neptunecc_kernels.h"
+test -f "$GLUE_DIR/neptunecc_kernels.cpp"
+test -f "$GLUE_DIR/neptunecc_generated.cmake"
+grep -q "namespace neptunecc" "$GLUE_DIR/neptunecc_kernels.h"
+! grep -q "int k0" "$GLUE_DIR/neptunecc_kernels.h"
+
+REWRITE_DIR="$OUTDIR/rewritten"
+REWRITE_FILE="$REWRITE_DIR/$(basename "$INPUT_FILE")"
+test -f "$REWRITE_FILE"
+grep -q '#pragma neptune kernel begin' "$REWRITE_FILE"

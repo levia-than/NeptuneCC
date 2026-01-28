@@ -5,6 +5,7 @@
 
 namespace neptune {
 
-bool writeManifest(const EventDB &db, llvm::StringRef outDir);
+bool writeManifest(const EventDB &db, llvm::StringRef outDir,
+                   bool emitKernelsMLIR = false);
 
 } // namespace neptune

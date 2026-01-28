@@ -1,4 +1,5 @@
 #include "Frontend/Clang/NeptuneBinder.h"
+#include "Frontend/Clang/NeptuneGlueGen.h"
 #include "Frontend/Clang/NeptuneManifest.h"
 #include "Frontend/Clang/NeptuneMLIRGen.h"
 #include "Frontend/Clang/NeptunePragma.h"
@@ -24,6 +25,18 @@ llvm::cl::OptionCategory NeptuneCategory("neptune-cc options");
 llvm::cl::opt<std::string> OutDirOpt(
     "out-dir", llvm::cl::desc("Output directory for manifest.json"),
     llvm::cl::init("neptune_out"), llvm::cl::cat(NeptuneCategory));
+llvm::cl::opt<bool> EmitKernelsMLIR(
+    "emit-kernels-mlir",
+    llvm::cl::desc("Emit kernels.mlir for debugging"),
+    llvm::cl::init(false), llvm::cl::cat(NeptuneCategory));
+llvm::cl::opt<bool> EmitEmitCMLIR(
+    "emit-emitc-mlir",
+    llvm::cl::desc("Emit emitc.mlir for Halide pipeline debugging"),
+    llvm::cl::init(false), llvm::cl::cat(NeptuneCategory));
+llvm::cl::opt<bool> EmitHalide(
+    "emit-halide",
+    llvm::cl::desc("Emit Halide generator C++ (halide_kernels.cpp)"),
+    llvm::cl::init(false), llvm::cl::cat(NeptuneCategory));
 
 class NeptuneASTConsumer final : public clang::ASTConsumer {
 public:
@@ -144,7 +157,22 @@ int main(int argc, const char **argv) {
   int result = tool.run(&factory);
 
   llvm::SmallString<256> outDir(OutDirOpt);
-  if (!neptune::writeManifest(outDb, outDir)) {
+  if (!neptune::writeManifest(outDb, outDir, EmitKernelsMLIR)) {
+    return result == 0 ? 1 : result;
+  }
+  if (!neptune::writeGlue(outDb, outDir)) {
+    return result == 0 ? 1 : result;
+  }
+  if (EmitHalide || EmitEmitCMLIR) {
+    if (!neptune::writeHalideHelper(outDir)) {
+      return result == 0 ? 1 : result;
+    }
+    if (!neptune::writeHalideGenerators(outDb, outDir, EmitEmitCMLIR,
+                                        EmitHalide)) {
+      return result == 0 ? 1 : result;
+    }
+  }
+  if (!neptune::rewriteKernelSources(outDb, outDir)) {
     return result == 0 ? 1 : result;
   }
 
