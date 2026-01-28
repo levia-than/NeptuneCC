@@ -110,9 +110,10 @@ static Value buildIntLiteral(OpBuilder &b, Location loc, int64_t value) {
 
 struct ExprEmitter {
   ExprEmitter(OpBuilder &b, Location loc, Type exprTy,
-              DenseMap<Value, Value> &inputToImage, Value xVar, Value yVar)
-      : b(b), loc(loc), exprTy(exprTy), inputToImage(inputToImage), xVar(xVar),
-        yVar(yVar) {}
+              DenseMap<Value, Value> &inputToImage,
+              ArrayRef<Value> halideVars)
+      : b(b), loc(loc), exprTy(exprTy), inputToImage(inputToImage),
+        halideVars(halideVars.begin(), halideVars.end()) {}
 
   FailureOr<Value> emit(Value v) {
     auto it = cache.find(v);
@@ -229,18 +230,23 @@ struct ExprEmitter {
     }
 
     auto offsets = acc.getOffsets();
-    if (offsets.size() != 2) {
-      acc.emitOpError("only 2D access supported for Halide EmitC emission");
+    if (offsets.size() != halideVars.size()) {
+      acc.emitOpError("access rank does not match apply rank");
       return failure();
     }
 
     // Halide expects dim0 to be the fastest-varying dimension (stride == 1),
-    // so map dim0 -> last IR index and dim1 -> first IR index.
-    Value ex = buildOffset(xVar, offsets[1]);
-    Value ey = buildOffset(yVar, offsets[0]);
+    // so map dim0 -> last IR index, dimN -> first IR index.
+    llvm::SmallVector<Value, 4> args;
+    args.reserve(1 + halideVars.size());
+    args.push_back(it->second);
+    for (size_t i = 0, e = halideVars.size(); i < e; ++i) {
+      size_t irIndex = e - 1 - i;
+      Value ex = buildOffset(halideVars[i], offsets[irIndex]);
+      args.push_back(ex);
+    }
 
-    auto call =
-        buildInvoke(b, loc, TypeRange{exprTy}, ValueRange{it->second, ex, ey});
+    auto call = buildInvoke(b, loc, TypeRange{exprTy}, args);
     return call.getResult(0);
   }
 
@@ -334,8 +340,7 @@ struct ExprEmitter {
   Location loc;
   Type exprTy;
   DenseMap<Value, Value> &inputToImage;
-  Value xVar;
-  Value yVar;
+  llvm::SmallVector<Value, 4> halideVars;
   DenseMap<Value, Value> cache;
 };
 
@@ -346,10 +351,12 @@ static LogicalResult emitOneKernel(OpBuilder &b, func::FuncOp func,
 
   auto bounds = apply.getBounds();
   auto lb = bounds.getLb().asArrayRef();
-  if (lb.size() != 2) {
-    apply.emitOpError("only 2D apply supported in neptuneir-emitc-halide");
+  auto ub = bounds.getUb().asArrayRef();
+  if (lb.empty() || lb.size() != ub.size()) {
+    apply.emitOpError("apply bounds are invalid");
     return failure();
   }
+  size_t rank = lb.size();
 
   auto tempTy = dyn_cast<TempType>(apply.getResult().getType());
   if (!tempTy) {
@@ -390,7 +397,7 @@ static LogicalResult emitOneKernel(OpBuilder &b, func::FuncOp func,
     return failure();
   }
 
-  Value dim = constI32(b, loc, 2);
+  Value dim = constI32(b, loc, static_cast<int32_t>(rank));
   StringRef kernelName = func.getSymName();
   Value kernelNameLit = buildCStringLiteral(b, loc, kernelName);
 
@@ -410,16 +417,16 @@ static LogicalResult emitOneKernel(OpBuilder &b, func::FuncOp func,
                                     ValueRange{kernelNameLit});
   Value outFunc = out.getResult(0);
 
-  Value xName = buildCStringLiteral(b, loc, "x");
-  Value yName = buildCStringLiteral(b, loc, "y");
-  Value xVar =
-      b.create<emitc::CallOpaqueOp>(loc, TypeRange{varTy}, "Halide::Var",
-                                    ValueRange{xName})
-          .getResult(0);
-  Value yVar =
-      b.create<emitc::CallOpaqueOp>(loc, TypeRange{varTy}, "Halide::Var",
-                                    ValueRange{yName})
-          .getResult(0);
+  llvm::SmallVector<Value, 4> vars;
+  vars.reserve(rank);
+  for (size_t i = 0; i < rank; ++i) {
+    Value vName = buildIndexedCStringLiteral(b, loc, "d", i);
+    Value v =
+        b.create<emitc::CallOpaqueOp>(loc, TypeRange{varTy}, "Halide::Var",
+                                      ValueRange{vName})
+            .getResult(0);
+    vars.push_back(v);
+  }
 
   auto argVec =
       b.create<emitc::CallOpaqueOp>(loc, TypeRange{argsTy},
@@ -456,15 +463,17 @@ static LogicalResult emitOneKernel(OpBuilder &b, func::FuncOp func,
     return failure();
   }
 
-  ExprEmitter emitter(b, loc, exprTy, inputToImage, xVar, yVar);
+  ExprEmitter emitter(b, loc, exprTy, inputToImage, vars);
   FailureOr<Value> expr = emitter.emit(yield.getResults().front());
   if (failed(expr))
     return failure();
 
   {
-    auto funcRefCall =
-        buildInvoke(b, loc, TypeRange{funcRefTy},
-                    ValueRange{outFunc, xVar, yVar});
+    llvm::SmallVector<Value, 4> funcArgs;
+    funcArgs.reserve(1 + vars.size());
+    funcArgs.push_back(outFunc);
+    funcArgs.append(vars.begin(), vars.end());
+    auto funcRefCall = buildInvoke(b, loc, TypeRange{funcRefTy}, funcArgs);
     Value funcRef = funcRefCall.getResult(0);
     b.create<emitc::CallOpaqueOp>(
         loc, TypeRange{}, "neptune_halide::assign",

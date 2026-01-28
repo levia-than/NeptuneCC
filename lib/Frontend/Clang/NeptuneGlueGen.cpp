@@ -11,16 +11,17 @@
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Target/Cpp/CppEmitter.h"
 #include "Passes/NeptuneIRPasses.h"
-#include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
-#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
-#include "llvm/Support/Path.h"
+#include "llvm/Support/raw_os_ostream.h"
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
+#include <cstdlib>
 #include <cstddef>
+#include <filesystem>
+#include <fstream>
 #include <optional>
 #include <string>
 
@@ -30,6 +31,7 @@ namespace {
 struct PortInfo {
   std::string name;
   bool isInput = false;
+  bool isGhosted = false;
   unsigned roleIndex = 0;
   unsigned argIndex = 0;
   unsigned rank = 0;
@@ -44,9 +46,11 @@ struct KernelInfo {
   bool halideCompatible = false;
   bool hasOutputBounds = false;
   bool boundsValid = false;
-  int64_t outMin[2] = {0, 0};
-  int64_t outExtent[2] = {0, 0};
+  llvm::SmallVector<int64_t, 4> outMin;
+  llvm::SmallVector<int64_t, 4> outExtent;
   llvm::SmallVector<int64_t, 4> radius;
+  std::string radiusSource;
+  std::string boundsSource;
 };
 
 struct Replacement {
@@ -67,6 +71,7 @@ struct ApplyStencilInfo {
   llvm::SmallVector<int64_t, 4> lb;
   llvm::SmallVector<int64_t, 4> ub;
   llvm::SmallVector<int64_t, 4> radius;
+  std::string radiusSource;
 };
 
 static bool matchConstantIndex(mlir::Value v, int64_t &out) {
@@ -220,10 +225,13 @@ inferStencilFromApply(mlir::ModuleOp module, mlir::func::FuncOp func) {
 
   if (auto radius = apply.getRadius()) {
     info.radius.assign(radius->begin(), radius->end());
+    info.radiusSource = "attr";
   } else {
     info.radius.assign(lb.size(), 0);
     bool ok = true;
+    bool sawAccess = false;
     apply.walk([&](mlir::Neptune::NeptuneIR::AccessOp acc) {
+      sawAccess = true;
       auto offsets = acc.getOffsets();
       if (offsets.size() != info.radius.size()) {
         ok = false;
@@ -237,8 +245,11 @@ inferStencilFromApply(mlir::ModuleOp module, mlir::func::FuncOp func) {
           info.radius[i] = v;
       }
     });
-    if (!ok) {
-      return std::nullopt;
+    if (!ok || !sawAccess) {
+      info.radius.assign(lb.size(), 1);
+      info.radiusSource = "default";
+    } else {
+      info.radiusSource = "derived";
     }
   }
 
@@ -295,6 +306,18 @@ static void printI64Array(llvm::raw_ostream &os,
   os << "]";
 }
 
+static bool ensureDir(const std::filesystem::path &dir,
+                      llvm::StringRef label) {
+  std::error_code ec;
+  std::filesystem::create_directories(dir, ec);
+  if (ec) {
+    llvm::errs() << "neptune-cc: failed to create " << label << " dir '"
+                 << dir.string() << "': " << ec.message() << "\n";
+    return false;
+  }
+  return true;
+}
+
 static bool parsePortMapEntry(llvm::StringRef entry, PortInfo &out,
                               llvm::raw_ostream &errs) {
   auto parts = entry.split('=');
@@ -329,6 +352,13 @@ static bool parsePortMapEntry(llvm::StringRef entry, PortInfo &out,
   } else {
     errs << "neptune-cc: invalid port_map role '" << role << "'\n";
     return false;
+  }
+
+  if (fields.size() >= 3) {
+    llvm::StringRef storage = fields[1].trim();
+    if (storage == "ghosted") {
+      out.isGhosted = true;
+    }
   }
 
   llvm::StringRef argPart = fields.back().trim();
@@ -441,7 +471,8 @@ static bool collectKernelInfos(const EventDB &db,
           outPort = &port;
         }
       }
-      if (inPort && outPort && inPort->rank == 2 && outPort->rank == 2) {
+      if (inPort && outPort && inPort->rank == outPort->rank &&
+          inPort->rank > 0) {
         info.halideCompatible = true;
       }
     }
@@ -450,6 +481,7 @@ static bool collectKernelInfos(const EventDB &db,
       bool boundsFromApply = false;
       bool boundsFromScf = false;
       llvm::SmallVector<int64_t, 4> radius;
+      std::string radiusSource;
 
       auto applyInfo = inferStencilFromApply(module, func);
       if (applyInfo) {
@@ -464,31 +496,32 @@ static bool collectKernelInfos(const EventDB &db,
           }
           if (ok) {
             info.hasOutputBounds = true;
-            info.outMin[0] = applyInfo->lb[0];
-            info.outMin[1] = applyInfo->lb[1];
-            info.outExtent[0] = applyInfo->ub[0] - applyInfo->lb[0];
-            info.outExtent[1] = applyInfo->ub[1] - applyInfo->lb[1];
+            info.outMin.assign(applyInfo->lb.begin(), applyInfo->lb.end());
+            info.outExtent.assign(outPort->rank, 0);
+            for (size_t d = 0; d < outPort->rank; ++d) {
+              info.outExtent[d] = applyInfo->ub[d] - applyInfo->lb[d];
+            }
             radius.assign(applyInfo->radius.begin(), applyInfo->radius.end());
+            radiusSource = applyInfo->radiusSource;
             boundsFromApply = true;
           }
         }
       }
 
-      if (!boundsFromApply) {
+      if (!boundsFromApply && outPort->rank == 2) {
         auto bounds = findStencilBounds(func);
         if (bounds && outPort->argIndex == bounds->outputArgIndex &&
-            outPort->rank == 2 && outPort->shape.size() == 2) {
+            outPort->shape.size() == 2) {
           int64_t lbI = bounds->lbI;
           int64_t ubI = bounds->ubI;
           int64_t lbJ = bounds->lbJ;
           int64_t ubJ = bounds->ubJ;
           if (lbI >= 0 && lbJ >= 0 && ubI > lbI && ubJ > lbJ) {
             info.hasOutputBounds = true;
-            info.outMin[0] = lbI;
-            info.outMin[1] = lbJ;
-            info.outExtent[0] = ubI - lbI;
-            info.outExtent[1] = ubJ - lbJ;
-            radius.assign({1, 1});
+            info.outMin.assign({lbI, lbJ});
+            info.outExtent.assign({ubI - lbI, ubJ - lbJ});
+            radius.assign(outPort->rank, 1);
+            radiusSource = "default";
             boundsFromScf = true;
           }
         }
@@ -504,44 +537,19 @@ static bool collectKernelInfos(const EventDB &db,
 
       if (info.hasOutputBounds) {
         if (!validateStencilBounds(
-                llvm::ArrayRef<int64_t>(info.outMin, outPort->rank),
-                llvm::ArrayRef<int64_t>(info.outExtent, outPort->rank), radius,
-                inPort->shape, tag)) {
+                info.outMin, info.outExtent, radius, inPort->shape, tag)) {
           info.hasOutputBounds = false;
         } else {
           info.boundsValid = true;
           info.radius = std::move(radius);
+          info.radiusSource = radiusSource;
+          info.boundsSource = boundsFromApply ? "neptune.ir.apply" : "scf.for";
           if (boundsFromApply) {
-            llvm::errs() << "neptune-cc: bounds from neptune.ir.apply for '"
+            llvm::outs() << "neptune-cc: bounds from neptune.ir.apply for '"
                          << tag << "'\n";
-            llvm::errs() << "neptune-cc:   outMin=";
-            printI64Array(llvm::errs(),
-                          llvm::ArrayRef<int64_t>(info.outMin, outPort->rank));
-            llvm::errs() << " outExtent=";
-            printI64Array(
-                llvm::errs(),
-                llvm::ArrayRef<int64_t>(info.outExtent, outPort->rank));
-            llvm::errs() << " radius=";
-            printI64Array(llvm::errs(), info.radius);
-            llvm::errs() << " inShape=";
-            printI64Array(llvm::errs(), inPort->shape);
-            llvm::errs() << "\n";
           } else if (boundsFromScf) {
-            llvm::errs()
-                << "neptune-cc: fallback bounds from scf.for for '" << tag
-                << "'\n";
-            llvm::errs() << "neptune-cc:   outMin=";
-            printI64Array(llvm::errs(),
-                          llvm::ArrayRef<int64_t>(info.outMin, outPort->rank));
-            llvm::errs() << " outExtent=";
-            printI64Array(
-                llvm::errs(),
-                llvm::ArrayRef<int64_t>(info.outExtent, outPort->rank));
-            llvm::errs() << " radius=";
-            printI64Array(llvm::errs(), info.radius);
-            llvm::errs() << " inShape=";
-            printI64Array(llvm::errs(), inPort->shape);
-            llvm::errs() << "\n";
+            llvm::outs() << "neptune-cc: fallback bounds from scf.for for '"
+                         << tag << "'\n";
           }
         }
       }
@@ -690,16 +698,13 @@ static void ensureKernelInclude(std::string &content) {
   content.insert(insertPos, includeLine);
 }
 
-static bool writeGlueHeader(llvm::StringRef glueDir,
+static bool writeGlueHeader(const std::filesystem::path &glueDir,
                             llvm::ArrayRef<KernelInfo> kernels) {
-  llvm::SmallString<256> headerPath(glueDir);
-  llvm::sys::path::append(headerPath, "neptunecc_kernels.h");
-
-  std::error_code ec;
-  llvm::raw_fd_ostream os(headerPath, ec, llvm::sys::fs::OF_Text);
-  if (ec) {
+  std::filesystem::path headerPath = glueDir / "neptunecc_kernels.h";
+  std::ofstream os(headerPath);
+  if (!os.is_open()) {
     llvm::errs() << "neptune-cc: failed to open glue header '"
-                 << headerPath << "': " << ec.message() << "\n";
+                 << headerPath.string() << "'\n";
     return false;
   }
 
@@ -711,7 +716,7 @@ static bool writeGlueHeader(llvm::StringRef glueDir,
       if (!kernel.halideCompatible) {
         llvm::errs() << "neptune-cc: skipping glue header for kernel '"
                      << kernel.tag
-                     << "' (Halide AOT supports single 2D input/output)\n";
+                     << "' (requires single input/output with matching rank)\n";
       } else {
         llvm::errs() << "neptune-cc: skipping glue header for kernel '"
                      << kernel.tag << "' (no valid stencil bounds)\n";
@@ -731,16 +736,13 @@ static bool writeGlueHeader(llvm::StringRef glueDir,
   return true;
 }
 
-static bool writeGlueCpp(llvm::StringRef glueDir,
+static bool writeGlueCpp(const std::filesystem::path &glueDir,
                          llvm::ArrayRef<KernelInfo> kernels) {
-  llvm::SmallString<256> cppPath(glueDir);
-  llvm::sys::path::append(cppPath, "neptunecc_kernels.cpp");
-
-  std::error_code ec;
-  llvm::raw_fd_ostream os(cppPath, ec, llvm::sys::fs::OF_Text);
-  if (ec) {
-    llvm::errs() << "neptune-cc: failed to open glue source '" << cppPath
-                 << "': " << ec.message() << "\n";
+  std::filesystem::path cppPath = glueDir / "neptunecc_kernels.cpp";
+  std::ofstream os(cppPath);
+  if (!os.is_open()) {
+    llvm::errs() << "neptune-cc: failed to open glue source '"
+                 << cppPath.string() << "'\n";
     return false;
   }
 
@@ -765,14 +767,56 @@ static bool writeGlueCpp(llvm::StringRef glueDir,
   os << "// dim0 corresponds to the last IR index (fastest varying),\n";
   os << "// dim1 corresponds to the first IR index. offset_elems uses\n";
   os << "// row-major: offset = sum(outMin[d] * stride[d]).\n\n";
+  const char *ghostedEnv = std::getenv("NEPTUNECC_GHOSTED_BASE");
+  const bool allowGhostedPolicy =
+      ghostedEnv && ghostedEnv[0] != '\0' && ghostedEnv[0] != '0';
+  if (allowGhostedPolicy) {
+    llvm::outs() << "neptune-cc: ghosted input policy enabled (P1)\n";
+  }
 
   for (const auto &kernel : kernels) {
     if (!kernel.halideCompatible || !kernel.boundsValid) {
       continue;
     }
+    const PortInfo *inPort = nullptr;
+    const PortInfo *outPort = nullptr;
     for (const auto &port : kernel.ports) {
-      llvm::StringRef prefix = port.isInput ? "in" : "out";
-      size_t rank = port.shape.size();
+      if (port.isInput) {
+        inPort = &port;
+      } else {
+        outPort = &port;
+      }
+    }
+    if (!inPort || !outPort) {
+      continue;
+    }
+    size_t rank = inPort->rank;
+    if (kernel.outMin.size() != rank || kernel.outExtent.size() != rank ||
+        kernel.radius.size() != rank) {
+      llvm::errs() << "neptune-cc: mismatched stencil metadata for kernel '"
+                   << kernel.tag << "'\n";
+      continue;
+    }
+    llvm::outs() << "neptune-cc: glue kernel '" << kernel.tag << "'\n";
+    llvm::outs() << "neptune-cc:   rank=" << rank << " shape=";
+    printI64Array(llvm::outs(), inPort->shape);
+    if (!kernel.boundsSource.empty()) {
+      llvm::outs() << " bounds=" << kernel.boundsSource;
+    }
+    if (!kernel.radiusSource.empty()) {
+      llvm::outs() << " radius_source=" << kernel.radiusSource;
+    }
+    llvm::outs() << "\n";
+    llvm::outs() << "neptune-cc:   outMin=";
+    printI64Array(llvm::outs(), kernel.outMin);
+    llvm::outs() << " outExtent=";
+    printI64Array(llvm::outs(), kernel.outExtent);
+    llvm::outs() << " radius=";
+    printI64Array(llvm::outs(), kernel.radius);
+    llvm::outs() << "\n";
+
+    for (const auto &port : kernel.ports) {
+      const char *prefix = port.isInput ? "in" : "out";
       llvm::SmallVector<int64_t, 4> strides(rank, 1);
       for (size_t i = rank; i-- > 1;) {
         strides[i - 1] = strides[i] * port.shape[i];
@@ -782,16 +826,43 @@ static bool writeGlueCpp(llvm::StringRef glueDir,
       llvm::SmallVector<int64_t, 4> extents(rank, 0);
       int64_t offsetElems = 0;
       if (port.isInput) {
+        bool useGhosted = port.isGhosted && allowGhostedPolicy;
+        const char *policy = useGhosted ? "P1" : "P0";
         for (size_t d = 0; d < rank; ++d) {
-          mins[d] = -kernel.outMin[d];
+          if (useGhosted) {
+            mins[d] = -kernel.radius[d];
+          } else {
+            mins[d] = -kernel.outMin[d];
+          }
           extents[d] = port.shape[d];
         }
+        if (useGhosted) {
+          for (size_t d = 0; d < rank; ++d) {
+            offsetElems += (kernel.outMin[d] - kernel.radius[d]) * strides[d];
+          }
+        }
+        llvm::outs() << "neptune-cc:   " << prefix << port.roleIndex
+                     << " policy=" << policy;
+        if (port.isGhosted) {
+          if (useGhosted) {
+            llvm::outs() << "(ghosted)";
+          } else {
+            llvm::outs() << "(ghosted->P0)";
+          }
+        }
+        llvm::outs() << " mins=";
+        printI64Array(llvm::outs(), mins);
+        llvm::outs() << " host_offset_elems=" << offsetElems << "\n";
       } else {
         for (size_t d = 0; d < rank; ++d) {
           mins[d] = 0;
           extents[d] = kernel.outExtent[d];
           offsetElems += kernel.outMin[d] * strides[d];
         }
+        llvm::outs() << "neptune-cc:   " << prefix << port.roleIndex
+                     << " mins=";
+        printI64Array(llvm::outs(), mins);
+        llvm::outs() << " host_offset_elems=" << offsetElems << "\n";
       }
 
       os << "static const halide_dimension_t " << kernel.tag << "_" << prefix
@@ -839,7 +910,7 @@ static bool writeGlueCpp(llvm::StringRef glueDir,
     os << ") {\n";
 
     for (const auto &port : kernel.ports) {
-      llvm::StringRef prefix = port.isInput ? "in" : "out";
+      const char *prefix = port.isInput ? "in" : "out";
       os << "  halide_buffer_t " << prefix << port.roleIndex << "_buf;\n";
       os << "  init_" << kernel.tag << "_" << prefix << port.roleIndex << "("
          << prefix << port.roleIndex << "_buf, " << port.name << ");\n";
@@ -851,7 +922,7 @@ static bool writeGlueCpp(llvm::StringRef glueDir,
         os << ", ";
       }
       const auto &port = kernel.ports[i];
-      llvm::StringRef prefix = port.isInput ? "in" : "out";
+      const char *prefix = port.isInput ? "in" : "out";
       os << "&" << prefix << port.roleIndex << "_buf";
     }
     os << ");\n";
@@ -862,16 +933,13 @@ static bool writeGlueCpp(llvm::StringRef glueDir,
   return true;
 }
 
-static bool writeGlueCMake(llvm::StringRef glueDir,
+static bool writeGlueCMake(const std::filesystem::path &glueDir,
                            llvm::ArrayRef<KernelInfo> kernels) {
-  llvm::SmallString<256> cmakePath(glueDir);
-  llvm::sys::path::append(cmakePath, "neptunecc_generated.cmake");
-
-  std::error_code ec;
-  llvm::raw_fd_ostream os(cmakePath, ec, llvm::sys::fs::OF_Text);
-  if (ec) {
+  std::filesystem::path cmakePath = glueDir / "neptunecc_generated.cmake";
+  std::ofstream os(cmakePath);
+  if (!os.is_open()) {
     llvm::errs() << "neptune-cc: failed to open glue cmake '"
-                 << cmakePath << "': " << ec.message() << "\n";
+                 << cmakePath.string() << "'\n";
     return false;
   }
 
@@ -890,7 +958,7 @@ static bool writeGlueCMake(llvm::StringRef glueDir,
       if (!kernel.halideCompatible) {
         llvm::errs() << "neptune-cc: skipping CMake target for kernel '"
                      << kernel.tag
-                     << "' (Halide AOT supports single 2D input/output)\n";
+                     << "' (requires single input/output with matching rank)\n";
       } else {
         llvm::errs() << "neptune-cc: skipping CMake target for kernel '"
                      << kernel.tag << "' (no valid stencil bounds)\n";
@@ -916,15 +984,12 @@ static bool writeGlueCMake(llvm::StringRef glueDir,
   return true;
 }
 
-static bool writeHalideHelperFile(llvm::StringRef halideDir) {
-  llvm::SmallString<256> helperPath(halideDir);
-  llvm::sys::path::append(helperPath, "NeptuneHalideHelpers.h");
-
-  std::error_code ec;
-  llvm::raw_fd_ostream os(helperPath, ec, llvm::sys::fs::OF_Text);
-  if (ec) {
+static bool writeHalideHelperFile(const std::filesystem::path &halideDir) {
+  std::filesystem::path helperPath = halideDir / "NeptuneHalideHelpers.h";
+  std::ofstream os(helperPath);
+  if (!os.is_open()) {
     llvm::errs() << "neptune-cc: failed to open Halide helper header '"
-                 << helperPath << "': " << ec.message() << "\n";
+                 << helperPath.string() << "'\n";
     return false;
   }
 
@@ -957,12 +1022,8 @@ bool writeGlue(const EventDB &db, llvm::StringRef outDir) {
     return false;
   }
 
-  llvm::SmallString<256> glueDir(outDir);
-  llvm::sys::path::append(glueDir, "glue");
-  std::error_code ec = llvm::sys::fs::create_directories(glueDir);
-  if (ec) {
-    llvm::errs() << "neptune-cc: failed to create glue dir '" << glueDir
-                 << "': " << ec.message() << "\n";
+  std::filesystem::path glueDir = std::filesystem::path(outDir.str()) / "glue";
+  if (!ensureDir(glueDir, "glue")) {
     return false;
   }
 
@@ -980,12 +1041,9 @@ bool writeGlue(const EventDB &db, llvm::StringRef outDir) {
 }
 
 bool writeHalideHelper(llvm::StringRef outDir) {
-  llvm::SmallString<256> halideDir(outDir);
-  llvm::sys::path::append(halideDir, "halide");
-  std::error_code ec = llvm::sys::fs::create_directories(halideDir);
-  if (ec) {
-    llvm::errs() << "neptune-cc: failed to create halide dir '" << halideDir
-                 << "': " << ec.message() << "\n";
+  std::filesystem::path halideDir =
+      std::filesystem::path(outDir.str()) / "halide";
+  if (!ensureDir(halideDir, "halide")) {
     return false;
   }
   return writeHalideHelperFile(halideDir);
@@ -1026,7 +1084,7 @@ bool rewriteKernelSources(const EventDB &db, llvm::StringRef outDir) {
     if (!it->second->halideCompatible || !it->second->boundsValid) {
       if (!it->second->halideCompatible) {
         llvm::errs() << "neptune-cc: skipping rewrite for kernel '" << tag
-                     << "' (Halide AOT supports single 2D input/output)\n";
+                     << "' (requires single input/output with matching rank)\n";
       } else {
         llvm::errs() << "neptune-cc: skipping rewrite for kernel '" << tag
                      << "' (no valid stencil bounds)\n";
@@ -1084,12 +1142,9 @@ bool rewriteKernelSources(const EventDB &db, llvm::StringRef outDir) {
     return true;
   }
 
-  llvm::SmallString<256> rewriteDir(outDir);
-  llvm::sys::path::append(rewriteDir, "rewritten");
-  std::error_code ec = llvm::sys::fs::create_directories(rewriteDir);
-  if (ec) {
-    llvm::errs() << "neptune-cc: failed to create rewritten dir '"
-                 << rewriteDir << "': " << ec.message() << "\n";
+  std::filesystem::path rewriteDir =
+      std::filesystem::path(outDir.str()) / "rewritten";
+  if (!ensureDir(rewriteDir, "rewritten")) {
     return false;
   }
 
@@ -1124,13 +1179,12 @@ bool rewriteKernelSources(const EventDB &db, llvm::StringRef outDir) {
       ensureKernelInclude(content);
     }
 
-    llvm::SmallString<256> outPath(rewriteDir);
-    llvm::sys::path::append(outPath, llvm::sys::path::filename(filePath));
-    std::error_code writeEc;
-    llvm::raw_fd_ostream os(outPath, writeEc, llvm::sys::fs::OF_Text);
-    if (writeEc) {
+    std::filesystem::path outPath =
+        rewriteDir / std::filesystem::path(filePath.str()).filename();
+    std::ofstream os(outPath);
+    if (!os.is_open()) {
       llvm::errs() << "neptune-cc: failed to write rewritten source '"
-                   << outPath << "': " << writeEc.message() << "\n";
+                   << outPath.string() << "'\n";
       return false;
     }
     os << content;
@@ -1148,12 +1202,9 @@ bool writeHalideGenerators(const EventDB &db, llvm::StringRef outDir,
     return true;
   }
 
-  llvm::SmallString<256> halideDir(outDir);
-  llvm::sys::path::append(halideDir, "halide");
-  std::error_code ec = llvm::sys::fs::create_directories(halideDir);
-  if (ec) {
-    llvm::errs() << "neptune-cc: failed to create halide dir '" << halideDir
-                 << "': " << ec.message() << "\n";
+  std::filesystem::path halideDir =
+      std::filesystem::path(outDir.str()) / "halide";
+  if (!ensureDir(halideDir, "halide")) {
     return false;
   }
 
@@ -1173,29 +1224,27 @@ bool writeHalideGenerators(const EventDB &db, llvm::StringRef outDir,
   }
 
   if (emitEmitcMLIR) {
-    llvm::SmallString<256> emitcPath(halideDir);
-    llvm::sys::path::append(emitcPath, "emitc.mlir");
-    std::error_code emitcEC;
-    llvm::raw_fd_ostream os(emitcPath, emitcEC, llvm::sys::fs::OF_Text);
-    if (emitcEC) {
+    std::filesystem::path emitcPath = halideDir / "emitc.mlir";
+    std::ofstream emitcFile(emitcPath);
+    if (!emitcFile.is_open()) {
       llvm::errs() << "neptune-cc: failed to open emitc mlir '"
-                   << emitcPath << "': " << emitcEC.message() << "\n";
+                   << emitcPath.string() << "'\n";
       return false;
     }
+    llvm::raw_os_ostream os(emitcFile);
     module.print(os);
     os << "\n";
   }
 
   if (emitHalideCpp) {
-    llvm::SmallString<256> cppPath(halideDir);
-    llvm::sys::path::append(cppPath, "halide_kernels.cpp");
-    std::error_code cppEC;
-    llvm::raw_fd_ostream os(cppPath, cppEC, llvm::sys::fs::OF_Text);
-    if (cppEC) {
+    std::filesystem::path cppPath = halideDir / "halide_kernels.cpp";
+    std::ofstream cppFile(cppPath);
+    if (!cppFile.is_open()) {
       llvm::errs() << "neptune-cc: failed to open halide cpp '" << cppPath
-                   << "': " << cppEC.message() << "\n";
+                   << "'\n";
       return false;
     }
+    llvm::raw_os_ostream os(cppFile);
     if (mlir::failed(
             mlir::emitc::translateToCpp(module, os, false, "halide_kernels"))) {
       llvm::errs() << "neptune-cc: failed to translate emitc to C++\n";
