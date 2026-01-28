@@ -14,13 +14,14 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/Path.h"
 #include "llvm/Support/raw_os_ostream.h"
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
 #include <cstdlib>
 #include <cstddef>
-#include <filesystem>
 #include <fstream>
 #include <optional>
 #include <string>
@@ -306,13 +307,20 @@ static void printI64Array(llvm::raw_ostream &os,
   os << "]";
 }
 
-static bool ensureDir(const std::filesystem::path &dir,
-                      llvm::StringRef label) {
-  std::error_code ec;
-  std::filesystem::create_directories(dir, ec);
+static std::string joinPath(llvm::StringRef base,
+                            std::initializer_list<llvm::StringRef> parts) {
+  llvm::SmallString<256> path(base);
+  for (llvm::StringRef part : parts) {
+    llvm::sys::path::append(path, part);
+  }
+  return path.str().str();
+}
+
+static bool ensureDir(llvm::StringRef dir, llvm::StringRef label) {
+  std::error_code ec = llvm::sys::fs::create_directories(dir);
   if (ec) {
     llvm::errs() << "neptune-cc: failed to create " << label << " dir '"
-                 << dir.string() << "': " << ec.message() << "\n";
+                 << dir << "': " << ec.message() << "\n";
     return false;
   }
   return true;
@@ -698,13 +706,13 @@ static void ensureKernelInclude(std::string &content) {
   content.insert(insertPos, includeLine);
 }
 
-static bool writeGlueHeader(const std::filesystem::path &glueDir,
+static bool writeGlueHeader(llvm::StringRef glueDir,
                             llvm::ArrayRef<KernelInfo> kernels) {
-  std::filesystem::path headerPath = glueDir / "neptunecc_kernels.h";
+  std::string headerPath = joinPath(glueDir, {"neptunecc_kernels.h"});
   std::ofstream os(headerPath);
   if (!os.is_open()) {
     llvm::errs() << "neptune-cc: failed to open glue header '"
-                 << headerPath.string() << "'\n";
+                 << headerPath << "'\n";
     return false;
   }
 
@@ -736,13 +744,13 @@ static bool writeGlueHeader(const std::filesystem::path &glueDir,
   return true;
 }
 
-static bool writeGlueCpp(const std::filesystem::path &glueDir,
+static bool writeGlueCpp(llvm::StringRef glueDir,
                          llvm::ArrayRef<KernelInfo> kernels) {
-  std::filesystem::path cppPath = glueDir / "neptunecc_kernels.cpp";
+  std::string cppPath = joinPath(glueDir, {"neptunecc_kernels.cpp"});
   std::ofstream os(cppPath);
   if (!os.is_open()) {
     llvm::errs() << "neptune-cc: failed to open glue source '"
-                 << cppPath.string() << "'\n";
+                 << cppPath << "'\n";
     return false;
   }
 
@@ -933,13 +941,13 @@ static bool writeGlueCpp(const std::filesystem::path &glueDir,
   return true;
 }
 
-static bool writeGlueCMake(const std::filesystem::path &glueDir,
+static bool writeGlueCMake(llvm::StringRef glueDir,
                            llvm::ArrayRef<KernelInfo> kernels) {
-  std::filesystem::path cmakePath = glueDir / "neptunecc_generated.cmake";
+  std::string cmakePath = joinPath(glueDir, {"neptunecc_generated.cmake"});
   std::ofstream os(cmakePath);
   if (!os.is_open()) {
     llvm::errs() << "neptune-cc: failed to open glue cmake '"
-                 << cmakePath.string() << "'\n";
+                 << cmakePath << "'\n";
     return false;
   }
 
@@ -984,12 +992,13 @@ static bool writeGlueCMake(const std::filesystem::path &glueDir,
   return true;
 }
 
-static bool writeHalideHelperFile(const std::filesystem::path &halideDir) {
-  std::filesystem::path helperPath = halideDir / "NeptuneHalideHelpers.h";
+static bool writeHalideHelperFile(llvm::StringRef halideDir) {
+  std::string helperPath =
+      joinPath(halideDir, {"NeptuneHalideHelpers.h"});
   std::ofstream os(helperPath);
   if (!os.is_open()) {
     llvm::errs() << "neptune-cc: failed to open Halide helper header '"
-                 << helperPath.string() << "'\n";
+                 << helperPath << "'\n";
     return false;
   }
 
@@ -1022,7 +1031,7 @@ bool writeGlue(const EventDB &db, llvm::StringRef outDir) {
     return false;
   }
 
-  std::filesystem::path glueDir = std::filesystem::path(outDir.str()) / "glue";
+  std::string glueDir = joinPath(outDir, {"glue"});
   if (!ensureDir(glueDir, "glue")) {
     return false;
   }
@@ -1041,8 +1050,7 @@ bool writeGlue(const EventDB &db, llvm::StringRef outDir) {
 }
 
 bool writeHalideHelper(llvm::StringRef outDir) {
-  std::filesystem::path halideDir =
-      std::filesystem::path(outDir.str()) / "halide";
+  std::string halideDir = joinPath(outDir, {"halide"});
   if (!ensureDir(halideDir, "halide")) {
     return false;
   }
@@ -1142,8 +1150,7 @@ bool rewriteKernelSources(const EventDB &db, llvm::StringRef outDir) {
     return true;
   }
 
-  std::filesystem::path rewriteDir =
-      std::filesystem::path(outDir.str()) / "rewritten";
+  std::string rewriteDir = joinPath(outDir, {"rewritten"});
   if (!ensureDir(rewriteDir, "rewritten")) {
     return false;
   }
@@ -1179,12 +1186,12 @@ bool rewriteKernelSources(const EventDB &db, llvm::StringRef outDir) {
       ensureKernelInclude(content);
     }
 
-    std::filesystem::path outPath =
-        rewriteDir / std::filesystem::path(filePath.str()).filename();
-    std::ofstream os(outPath);
+    llvm::SmallString<256> outPath(rewriteDir);
+    llvm::sys::path::append(outPath, llvm::sys::path::filename(filePath));
+    std::ofstream os(outPath.str().str());
     if (!os.is_open()) {
       llvm::errs() << "neptune-cc: failed to write rewritten source '"
-                   << outPath.string() << "'\n";
+                   << outPath << "'\n";
       return false;
     }
     os << content;
@@ -1202,8 +1209,7 @@ bool writeHalideGenerators(const EventDB &db, llvm::StringRef outDir,
     return true;
   }
 
-  std::filesystem::path halideDir =
-      std::filesystem::path(outDir.str()) / "halide";
+  std::string halideDir = joinPath(outDir, {"halide"});
   if (!ensureDir(halideDir, "halide")) {
     return false;
   }
@@ -1224,11 +1230,11 @@ bool writeHalideGenerators(const EventDB &db, llvm::StringRef outDir,
   }
 
   if (emitEmitcMLIR) {
-    std::filesystem::path emitcPath = halideDir / "emitc.mlir";
+    std::string emitcPath = joinPath(halideDir, {"emitc.mlir"});
     std::ofstream emitcFile(emitcPath);
     if (!emitcFile.is_open()) {
       llvm::errs() << "neptune-cc: failed to open emitc mlir '"
-                   << emitcPath.string() << "'\n";
+                   << emitcPath << "'\n";
       return false;
     }
     llvm::raw_os_ostream os(emitcFile);
@@ -1237,7 +1243,7 @@ bool writeHalideGenerators(const EventDB &db, llvm::StringRef outDir,
   }
 
   if (emitHalideCpp) {
-    std::filesystem::path cppPath = halideDir / "halide_kernels.cpp";
+    std::string cppPath = joinPath(halideDir, {"halide_kernels.cpp"});
     std::ofstream cppFile(cppPath);
     if (!cppFile.is_open()) {
       llvm::errs() << "neptune-cc: failed to open halide cpp '" << cppPath
