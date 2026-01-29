@@ -29,9 +29,9 @@ func.func @k0(%arg0: memref<4x4xi32>, %arg1: memref<4x4xi32>) {
 
 // CHECK: neptune.ir.apply
 // CHECK: ^bb0(%[[T0:.*]]: !neptune.temp
-// CHECK-DAG: neptune.ir.access %[[T0]]\\[0, ?0\\]
-// CHECK-DAG: neptune.ir.access %[[T0]]\\[-1, ?0\\]
-// CHECK-DAG: neptune.ir.access %[[T0]]\\[1, ?0\\]
-// CHECK-DAG: neptune.ir.access %[[T0]]\\[0, ?-1\\]
-// CHECK-DAG: neptune.ir.access %[[T0]]\\[0, ?1\\]
+// CHECK-DAG: neptune.ir.access %[[T0]] \\[0, ?0\\]
+// CHECK-DAG: neptune.ir.access %[[T0]] \\[-1, ?0\\]
+// CHECK-DAG: neptune.ir.access %[[T0]] \\[1, ?0\\]
+// CHECK-DAG: neptune.ir.access %[[T0]] \\[0, ?-1\\]
+// CHECK-DAG: neptune.ir.access %[[T0]] \\[0, ?1\\]
 // CHECK: neptune.ir.store
