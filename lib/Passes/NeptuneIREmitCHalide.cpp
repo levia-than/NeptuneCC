@@ -108,6 +108,39 @@ static Value buildIntLiteral(OpBuilder &b, Location loc, int64_t value) {
   return b.create<emitc::LiteralOp>(loc, intTy, b.getStringAttr(literal));
 }
 
+struct ScheduleAttr {
+  llvm::SmallVector<int64_t, 4> tile;
+  int64_t vec = 1;
+  int64_t unroll = 1;
+  StringRef parDim = "none";
+  bool valid = false;
+};
+
+static ScheduleAttr parseScheduleAttr(ApplyOp apply, size_t rank) {
+  ScheduleAttr info;
+  auto dict = apply->getAttrOfType<DictionaryAttr>("neptune.schedule");
+  if (!dict)
+    return info;
+
+  auto tileAttr = dict.getAs<DenseI64ArrayAttr>("tile");
+  if (!tileAttr)
+    return info;
+  auto tileVals = tileAttr.asArrayRef();
+  if (tileVals.size() != rank)
+    return info;
+  info.tile.assign(tileVals.begin(), tileVals.end());
+
+  if (auto vecAttr = dict.getAs<IntegerAttr>("vec"))
+    info.vec = vecAttr.getInt();
+  if (auto unrollAttr = dict.getAs<IntegerAttr>("unroll"))
+    info.unroll = unrollAttr.getInt();
+  if (auto parAttr = dict.getAs<StringAttr>("par_dim"))
+    info.parDim = parAttr.getValue();
+
+  info.valid = true;
+  return info;
+}
+
 struct ExprEmitter {
   ExprEmitter(OpBuilder &b, Location loc, Type exprTy,
               DenseMap<Value, Value> &inputToImage,
@@ -481,6 +514,48 @@ static LogicalResult emitOneKernel(OpBuilder &b, func::FuncOp func,
   }
 
   {
+    ScheduleAttr schedule = parseScheduleAttr(apply, rank);
+    if (schedule.valid) {
+      int64_t parDim = 0;
+      if (schedule.parDim == "y")
+        parDim = 1;
+      else if (schedule.parDim == "z")
+        parDim = 2;
+
+      llvm::SmallVector<Value, 6> args;
+      args.push_back(outFunc);
+      if (rank == 1) {
+        args.push_back(buildIntLiteral(b, loc, schedule.tile[0]));
+        args.push_back(buildIntLiteral(b, loc, schedule.vec));
+        args.push_back(buildIntLiteral(b, loc, parDim));
+        args.push_back(buildIntLiteral(b, loc, schedule.unroll));
+        b.create<emitc::CallOpaqueOp>(loc, TypeRange{},
+                                      "neptune_halide::schedule_1d", args);
+      } else if (rank == 2) {
+        int64_t tx = schedule.tile[1];
+        int64_t ty = schedule.tile[0];
+        args.push_back(buildIntLiteral(b, loc, tx));
+        args.push_back(buildIntLiteral(b, loc, ty));
+        args.push_back(buildIntLiteral(b, loc, schedule.vec));
+        args.push_back(buildIntLiteral(b, loc, parDim));
+        args.push_back(buildIntLiteral(b, loc, schedule.unroll));
+        b.create<emitc::CallOpaqueOp>(loc, TypeRange{},
+                                      "neptune_halide::schedule_2d", args);
+      } else if (rank == 3) {
+        int64_t tx = schedule.tile[2];
+        int64_t ty = schedule.tile[1];
+        int64_t tz = schedule.tile[0];
+        args.push_back(buildIntLiteral(b, loc, tx));
+        args.push_back(buildIntLiteral(b, loc, ty));
+        args.push_back(buildIntLiteral(b, loc, tz));
+        args.push_back(buildIntLiteral(b, loc, schedule.vec));
+        args.push_back(buildIntLiteral(b, loc, parDim));
+        args.push_back(buildIntLiteral(b, loc, schedule.unroll));
+        b.create<emitc::CallOpaqueOp>(loc, TypeRange{},
+                                      "neptune_halide::schedule_3d", args);
+      }
+    }
+
     b.create<emitc::CallOpaqueOp>(
         loc, TypeRange{}, "neptune_halide::compile",
         ValueRange{outFunc, kernelNameLit, argsVal, kernelNameLit,

@@ -35,6 +35,11 @@ $(OUT)/halide/halide_kernels.cpp: $(OUT)/manifest.json
 	@echo "[check] expected $@"
 	@test -f $@
 
+$(OUT)/halide/schedule.check: $(OUT)/halide/halide_kernels.cpp
+	@echo "[check] schedule helper emitted"
+	@grep -q "neptune_halide::schedule_" $(OUT)/halide/halide_kernels.cpp
+	@touch $@
+
 $(OUT)/halide/halide_build: $(OUT)/halide/halide_kernels.cpp
 	@echo "[halide] build generator"
 	@printf '%s\n' \
@@ -72,7 +77,7 @@ $(OUT)/baseline.out: $(OUT)/baseline
 $(OUT)/generated.out: $(OUT)/generated
 	$(OUT)/generated > $@
 
-compare: $(OUT)/halide/k0.h $(OUT)/generated $(OUT)/baseline.out $(OUT)/generated.out
+compare: $(OUT)/halide/k0.h $(OUT)/halide/schedule.check $(OUT)/generated $(OUT)/baseline.out $(OUT)/generated.out
 	@echo "[compare] python3 compare.py"
 	python3 compare.py $(OUT)/baseline.out $(OUT)/generated.out
 

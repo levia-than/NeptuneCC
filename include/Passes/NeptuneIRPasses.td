@@ -73,4 +73,14 @@ def SCFBoundarySimplifyPass
   ];
 }
 
+def NeptuneIRInferHalideSchedulePass
+    : Pass<"neptuneir-infer-halide-schedule", "mlir::func::FuncOp"> {
+  let summary = "infer deterministic Halide schedules from apply bounds";
+  let dependentDialects = [
+    "mlir::func::FuncDialect",
+    "mlir::arith::ArithDialect",
+    "mlir::memref::MemRefDialect"
+  ];
+}
+
 #endif // NEPTUNEIR_PASSES_TD

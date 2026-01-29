@@ -3,6 +3,7 @@ add_mlir_library(MLIRNeptuneIRTransforms
     NeptuneIRNormalizeApply.cpp
     NeptuneIRSplitDomain.cpp
     NeptuneIREmitCHalide.cpp
+    NeptuneIRInferHalideSchedule.cpp
     SCFToNeptuneIR.cpp
     SCFBoundarySimplify.cpp
     DEPENDS MLIRNeptuneIRTransformsIncGen
