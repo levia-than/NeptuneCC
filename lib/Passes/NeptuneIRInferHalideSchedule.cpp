@@ -338,6 +338,12 @@ static bool inferScheduleForApply(func::FuncOp func, ApplyOp apply) {
   if (bestVolume < 0)
     tile = outExtent;
 
+  int64_t yIndex = (rank >= 2) ? static_cast<int64_t>(rank - 2) : -1;
+  int64_t yExtent = (yIndex >= 0) ? outExtent[static_cast<size_t>(yIndex)] : 0;
+  int64_t yTile = (yIndex >= 0) ? tile[static_cast<size_t>(yIndex)] : 0;
+  if (yTile > yExtent)
+    yTile = yExtent;
+
   llvm::StringRef parDim = "none";
   if (cfg.threads > 1) {
     if (rank == 2) {
@@ -355,6 +361,36 @@ static bool inferScheduleForApply(func::FuncOp func, ApplyOp apply) {
   }
 
   int64_t unroll = 1;
+  llvm::StringRef unrollDim = "y";
+  llvm::StringRef unrollReason = "";
+  if (rank >= 2) {
+    if (yTile < 2) {
+      unrollReason = "yi<2";
+    } else if (yTile % 2 != 0) {
+      unrollReason = "yi not divisible";
+    } else {
+      int64_t maxU = (rank == 3) ? 2 : 4;
+      int64_t footprint = computeFootprint(elemBytes, tile, radius);
+      bool allow4 = (maxU >= 4) && (yTile >= 4) && (vec <= 4) &&
+                    (yTile % 4 == 0) &&
+                    (static_cast<double>(footprint) <= limit);
+      if (allow4) {
+        unroll = 4;
+      } else {
+        unroll = 2;
+      }
+      if (rank == 3 && unroll > 2) {
+        unroll = 2;
+        unrollReason = "3D conservative cap";
+      }
+      if (unroll == 2 && (yTile % 2 != 0)) {
+        unroll = 1;
+        unrollReason = "yi not divisible";
+      }
+    }
+  } else {
+    unrollDim = "none";
+  }
 
   NamedAttrList scheduleAttrs;
   scheduleAttrs.set("tile", DenseI64ArrayAttr::get(ctx, tile));
@@ -362,6 +398,13 @@ static bool inferScheduleForApply(func::FuncOp func, ApplyOp apply) {
   scheduleAttrs.set("par_dim", StringAttr::get(ctx, parDim));
   scheduleAttrs.set("unroll",
                     IntegerAttr::get(IntegerType::get(ctx, 64), unroll));
+  scheduleAttrs.set("unroll_dim", StringAttr::get(ctx, unrollDim));
+  scheduleAttrs.set(
+      "unroll_factor",
+      IntegerAttr::get(IntegerType::get(ctx, 64), unroll));
+  scheduleAttrs.set(
+      "threads",
+      IntegerAttr::get(IntegerType::get(ctx, 64), cfg.threads));
   apply->setAttr("neptune.schedule", DictionaryAttr::get(ctx, scheduleAttrs));
 
   llvm::outs() << "neptune-cc: schedule for '" << func.getSymName()
@@ -373,6 +416,7 @@ static bool inferScheduleForApply(func::FuncOp func, ApplyOp apply) {
   printArray(llvm::outs(), outExtent);
   llvm::outs() << " radius=";
   printArray(llvm::outs(), radius);
+  llvm::outs() << " elem_bytes=" << elemBytes;
   llvm::outs() << " tile=";
   printArray(llvm::outs(), tile);
   llvm::outs() << " vec=" << vec << " par=" << parDim
@@ -386,6 +430,8 @@ static bool inferScheduleForApply(func::FuncOp func, ApplyOp apply) {
   if (!anyFit)
     llvm::outs() << " (cache fit not found; using largest candidate, footprint="
                  << bestFootprint << ")";
+  if (unroll == 1 && !unrollReason.empty())
+    llvm::outs() << " (unroll disabled: " << unrollReason << ")";
   llvm::outs() << "\n";
 
   return true;

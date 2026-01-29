@@ -112,6 +112,8 @@ struct ScheduleAttr {
   llvm::SmallVector<int64_t, 4> tile;
   int64_t vec = 1;
   int64_t unroll = 1;
+  int64_t threads = 1;
+  StringRef unrollDim = "none";
   StringRef parDim = "none";
   bool valid = false;
 };
@@ -132,10 +134,16 @@ static ScheduleAttr parseScheduleAttr(ApplyOp apply, size_t rank) {
 
   if (auto vecAttr = dict.getAs<IntegerAttr>("vec"))
     info.vec = vecAttr.getInt();
-  if (auto unrollAttr = dict.getAs<IntegerAttr>("unroll"))
+  if (auto unrollAttr = dict.getAs<IntegerAttr>("unroll_factor"))
     info.unroll = unrollAttr.getInt();
+  else if (auto unrollAttr = dict.getAs<IntegerAttr>("unroll"))
+    info.unroll = unrollAttr.getInt();
+  if (auto unrollDimAttr = dict.getAs<StringAttr>("unroll_dim"))
+    info.unrollDim = unrollDimAttr.getValue();
   if (auto parAttr = dict.getAs<StringAttr>("par_dim"))
     info.parDim = parAttr.getValue();
+  if (auto threadsAttr = dict.getAs<IntegerAttr>("threads"))
+    info.threads = threadsAttr.getInt();
 
   info.valid = true;
   return info;
@@ -522,13 +530,18 @@ static LogicalResult emitOneKernel(OpBuilder &b, func::FuncOp func,
       else if (schedule.parDim == "z")
         parDim = 2;
 
+      int64_t unrollY = (schedule.unrollDim == "y") ? schedule.unroll : 1;
+      int64_t enableParallel =
+          (parDim != 0 && schedule.threads > 1) ? 1 : 0;
+
       llvm::SmallVector<Value, 6> args;
       args.push_back(outFunc);
       if (rank == 1) {
         args.push_back(buildIntLiteral(b, loc, schedule.tile[0]));
         args.push_back(buildIntLiteral(b, loc, schedule.vec));
-        args.push_back(buildIntLiteral(b, loc, parDim));
-        args.push_back(buildIntLiteral(b, loc, schedule.unroll));
+        args.push_back(buildIntLiteral(b, loc, enableParallel));
+        args.push_back(buildIntLiteral(b, loc, schedule.threads));
+        args.push_back(buildIntLiteral(b, loc, unrollY));
         b.create<emitc::CallOpaqueOp>(loc, TypeRange{},
                                       "neptune_halide::schedule_1d", args);
       } else if (rank == 2) {
@@ -537,8 +550,9 @@ static LogicalResult emitOneKernel(OpBuilder &b, func::FuncOp func,
         args.push_back(buildIntLiteral(b, loc, tx));
         args.push_back(buildIntLiteral(b, loc, ty));
         args.push_back(buildIntLiteral(b, loc, schedule.vec));
-        args.push_back(buildIntLiteral(b, loc, parDim));
-        args.push_back(buildIntLiteral(b, loc, schedule.unroll));
+        args.push_back(buildIntLiteral(b, loc, unrollY));
+        args.push_back(buildIntLiteral(b, loc, enableParallel));
+        args.push_back(buildIntLiteral(b, loc, schedule.threads));
         b.create<emitc::CallOpaqueOp>(loc, TypeRange{},
                                       "neptune_halide::schedule_2d", args);
       } else if (rank == 3) {
@@ -549,8 +563,10 @@ static LogicalResult emitOneKernel(OpBuilder &b, func::FuncOp func,
         args.push_back(buildIntLiteral(b, loc, ty));
         args.push_back(buildIntLiteral(b, loc, tz));
         args.push_back(buildIntLiteral(b, loc, schedule.vec));
+        args.push_back(buildIntLiteral(b, loc, unrollY));
         args.push_back(buildIntLiteral(b, loc, parDim));
-        args.push_back(buildIntLiteral(b, loc, schedule.unroll));
+        args.push_back(buildIntLiteral(b, loc, enableParallel));
+        args.push_back(buildIntLiteral(b, loc, schedule.threads));
         b.create<emitc::CallOpaqueOp>(loc, TypeRange{},
                                       "neptune_halide::schedule_3d", args);
       }
