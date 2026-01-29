@@ -15,14 +15,13 @@
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
-#include "llvm/Support/raw_os_ostream.h"
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
 #include <cstdlib>
 #include <cstddef>
-#include <fstream>
 #include <optional>
 #include <string>
 
@@ -39,6 +38,12 @@ struct PortInfo {
   llvm::SmallVector<int64_t, 4> shape;
 };
 
+struct CopyPairInfo {
+  unsigned inArgIndex = 0;
+  unsigned outArgIndex = 0;
+  bool fullDomain = false;
+};
+
 struct KernelInfo {
   std::string tag;
   llvm::SmallVector<PortInfo, 8> ports;
@@ -47,6 +52,12 @@ struct KernelInfo {
   bool halideCompatible = false;
   bool hasOutputBounds = false;
   bool boundsValid = false;
+  bool partialCopyBoundary = false;
+  bool hasResidualScf = false;
+  std::string residualReason;
+  llvm::SmallVector<CopyPairInfo, 4> copyPairs;
+  llvm::SmallVector<unsigned, 4> halideArgs;
+  std::string boundaryCopyMode;
   llvm::SmallVector<int64_t, 4> outMin;
   llvm::SmallVector<int64_t, 4> outExtent;
   llvm::SmallVector<int64_t, 4> radius;
@@ -60,12 +71,34 @@ struct Replacement {
   std::string text;
 };
 
-struct StencilBounds {
-  int64_t lbI = 0;
-  int64_t ubI = 0;
-  int64_t lbJ = 0;
-  int64_t ubJ = 0;
-  unsigned outputArgIndex = 0;
+struct CodeWriter {
+  explicit CodeWriter(llvm::raw_ostream &out) : os(out) {}
+
+  void indent() { ++level; }
+  void dedent() {
+    if (level > 0)
+      --level;
+  }
+
+  void line(llvm::StringRef text = "") {
+    for (unsigned i = 0; i < level; ++i) {
+      os << "  ";
+    }
+    os << text << "\n";
+  }
+
+  void openBlock(llvm::StringRef header) {
+    line(header);
+    indent();
+  }
+
+  void closeBlock(llvm::StringRef trailer = "}") {
+    dedent();
+    line(trailer);
+  }
+
+  llvm::raw_ostream &os;
+  unsigned level = 0;
 };
 
 struct ApplyStencilInfo {
@@ -73,7 +106,19 @@ struct ApplyStencilInfo {
   llvm::SmallVector<int64_t, 4> ub;
   llvm::SmallVector<int64_t, 4> radius;
   std::string radiusSource;
+  llvm::SmallVector<unsigned, 4> applyInputArgs;
+  std::optional<unsigned> applyOutputArg;
+  bool hasResidualScf = false;
+  bool residualCopyBoundary = false;
+  llvm::SmallVector<CopyPairInfo, 4> copyPairs;
+  std::string residualReason;
 };
+
+static void logResidualDecision(const KernelInfo &info,
+                                llvm::raw_ostream &os);
+static void logKernelSummary(const KernelInfo &info, const PortInfo &shapePort,
+                             llvm::raw_ostream &os);
+static std::string parseBoundaryCopyMode();
 
 static bool matchConstantIndex(mlir::Value v, int64_t &out) {
   auto cst = v.getDefiningOp<mlir::arith::ConstantOp>();
@@ -88,100 +133,308 @@ static bool matchConstantIndex(mlir::Value v, int64_t &out) {
   return true;
 }
 
-static std::optional<StencilBounds> findStencilBounds(mlir::func::FuncOp func) {
-  llvm::SmallVector<mlir::scf::ForOp, 4> candidates;
-  func.walk([&](mlir::scf::ForOp forOp) {
-    if (!forOp->getParentOfType<mlir::scf::ForOp>()) {
-      candidates.push_back(forOp);
-    }
-  });
+static std::string parseBoundaryCopyMode() {
+  const char *modeEnv = std::getenv("NEPTUNECC_BOUNDARY_COPY_MODE");
+  if (!modeEnv || modeEnv[0] == '\0') {
+    return "slabs";
+  }
+  llvm::StringRef mode(modeEnv);
+  if (mode == "whole") {
+    return "whole";
+  }
+  if (mode == "slabs") {
+    return "slabs";
+  }
+  llvm::errs() << "neptune-cc: unknown NEPTUNECC_BOUNDARY_COPY_MODE '"
+               << mode << "', defaulting to slabs\n";
+  return "slabs";
+}
 
-  for (mlir::scf::ForOp outer : candidates) {
-    int64_t lbI = 0;
-    int64_t ubI = 0;
-    int64_t stepI = 0;
-    if (!matchConstantIndex(outer.getLowerBound(), lbI) ||
-        !matchConstantIndex(outer.getUpperBound(), ubI) ||
-        !matchConstantIndex(outer.getStep(), stepI) || stepI != 1) {
-      continue;
+static mlir::Value stripMemrefCasts(mlir::Value v) {
+  while (auto cast = v.getDefiningOp<mlir::memref::CastOp>()) {
+    v = cast.getSource();
+  }
+  return v;
+}
+
+static bool isConstLikeOp(mlir::Operation *op) {
+  if (llvm::isa<mlir::arith::ConstantOp, mlir::arith::ConstantIndexOp>(op)) {
+    return true;
+  }
+  if (auto addi = llvm::dyn_cast<mlir::arith::AddIOp>(op)) {
+    if (!addi.getType().isIndex()) {
+      return false;
+    }
+    int64_t lhs = 0;
+    int64_t rhs = 0;
+    return matchConstantIndex(addi.getLhs(), lhs) &&
+           matchConstantIndex(addi.getRhs(), rhs);
+  }
+  if (auto subi = llvm::dyn_cast<mlir::arith::SubIOp>(op)) {
+    if (!subi.getType().isIndex()) {
+      return false;
+    }
+    int64_t lhs = 0;
+    int64_t rhs = 0;
+    return matchConstantIndex(subi.getLhs(), lhs) &&
+           matchConstantIndex(subi.getRhs(), rhs);
+  }
+  return false;
+}
+
+static void addCopyPair(llvm::SmallVectorImpl<CopyPairInfo> &pairs,
+                        unsigned inArg, unsigned outArg, bool fullDomain) {
+  for (auto &p : pairs) {
+    if (p.inArgIndex == inArg && p.outArgIndex == outArg) {
+      p.fullDomain = p.fullDomain || fullDomain;
+      return;
+    }
+  }
+  CopyPairInfo info;
+  info.inArgIndex = inArg;
+  info.outArgIndex = outArg;
+  info.fullDomain = fullDomain;
+  pairs.push_back(info);
+}
+
+static bool collectCopyPairsFromLoopNest(
+    mlir::scf::ForOp outer, llvm::SmallVectorImpl<CopyPairInfo> &pairs,
+    std::string &reason) {
+  auto func = outer->getParentOfType<mlir::func::FuncOp>();
+  if (!func) {
+    reason = "residual loop not inside func";
+    return false;
+  }
+  llvm::SmallVector<mlir::scf::ForOp, 4> loops;
+  mlir::scf::ForOp current = outer;
+  while (true) {
+    int64_t step = 0;
+    if (!matchConstantIndex(current.getStep(), step) || step != 1) {
+      reason = "residual loop step != 1";
+      return false;
+    }
+    loops.push_back(current);
+    if (loops.size() > 3) {
+      reason = "residual loop rank > 3";
+      return false;
     }
 
     mlir::scf::ForOp inner;
-    mlir::Block &outerBody = *outer.getBody();
-    for (mlir::Operation &op : outerBody.getOperations()) {
-      if (auto forOp = llvm::dyn_cast<mlir::scf::ForOp>(op)) {
-        if (inner) {
-          inner = nullptr;
-          break;
+    bool sawLoadStore = false;
+    for (mlir::Operation &op : current.getBody()->without_terminator()) {
+      if (auto nested = llvm::dyn_cast<mlir::scf::ForOp>(op)) {
+        if (inner || sawLoadStore) {
+          reason = "non-perfect residual loop nest";
+          return false;
         }
-        inner = forOp;
+        inner = nested;
         continue;
       }
-      if (llvm::isa<mlir::arith::AddIOp, mlir::arith::SubIOp,
-                    mlir::arith::ConstantOp, mlir::scf::YieldOp>(op)) {
+      if (llvm::isa<mlir::memref::LoadOp, mlir::memref::StoreOp>(op)) {
+        sawLoadStore = true;
         continue;
       }
-      inner = nullptr;
+      if (llvm::isa<mlir::memref::CastOp>(op) || isConstLikeOp(&op)) {
+        continue;
+      }
+      reason = "unsupported op in residual loop";
+      return false;
+    }
+    if (inner) {
+      current = inner;
+      continue;
+    }
+
+    llvm::DenseMap<mlir::Value, unsigned> loadArgs;
+    bool sawStore = false;
+    for (mlir::Operation &op : current.getBody()->without_terminator()) {
+      if (auto load = llvm::dyn_cast<mlir::memref::LoadOp>(op)) {
+        auto memref = stripMemrefCasts(load.getMemref());
+        auto memrefTy = llvm::dyn_cast<mlir::MemRefType>(memref.getType());
+        if (!memrefTy || memrefTy.getRank() != static_cast<int>(loops.size())) {
+          reason = "residual load rank mismatch";
+          return false;
+        }
+        auto arg = llvm::dyn_cast<mlir::BlockArgument>(memref);
+        if (!arg || arg.getOwner() != &func.getBody().front()) {
+          reason = "residual load memref not block argument";
+          return false;
+        }
+        if (load.getIndices().size() != loops.size()) {
+          reason = "residual load indices mismatch";
+          return false;
+        }
+        for (size_t i = 0; i < loops.size(); ++i) {
+          if (load.getIndices()[i] != loops[i].getInductionVar()) {
+            reason = "residual load indices not ivs";
+            return false;
+          }
+        }
+        loadArgs[load.getResult()] = arg.getArgNumber();
+        continue;
+      }
+      if (auto store = llvm::dyn_cast<mlir::memref::StoreOp>(op)) {
+        auto memref = stripMemrefCasts(store.getMemref());
+        auto memrefTy = llvm::dyn_cast<mlir::MemRefType>(memref.getType());
+        if (!memrefTy || memrefTy.getRank() != static_cast<int>(loops.size())) {
+          reason = "residual store rank mismatch";
+          return false;
+        }
+        if (!memrefTy.hasStaticShape()) {
+          reason = "residual store dynamic shape";
+          return false;
+        }
+        auto arg = llvm::dyn_cast<mlir::BlockArgument>(memref);
+        if (!arg || arg.getOwner() != &func.getBody().front()) {
+          reason = "residual store memref not block argument";
+          return false;
+        }
+        if (store.getIndices().size() != loops.size()) {
+          reason = "residual store indices mismatch";
+          return false;
+        }
+        for (size_t i = 0; i < loops.size(); ++i) {
+          if (store.getIndices()[i] != loops[i].getInductionVar()) {
+            reason = "residual store indices not ivs";
+            return false;
+          }
+        }
+        auto it = loadArgs.find(store.getValue());
+        if (it == loadArgs.end()) {
+          reason = "store not from load";
+          return false;
+        }
+        bool fullDomain = true;
+        auto shape = memrefTy.getShape();
+        if (shape.size() != loops.size()) {
+          fullDomain = false;
+        }
+        for (size_t i = 0; i < loops.size() && i < shape.size(); ++i) {
+          int64_t lb = 0;
+          int64_t ub = 0;
+          if (!matchConstantIndex(loops[i].getLowerBound(), lb) ||
+              !matchConstantIndex(loops[i].getUpperBound(), ub)) {
+            fullDomain = false;
+            continue;
+          }
+          if (lb != 0 || ub != shape[i]) {
+            fullDomain = false;
+          }
+        }
+        addCopyPair(pairs, it->second, arg.getArgNumber(), fullDomain);
+        sawStore = true;
+        continue;
+      }
+      if (llvm::isa<mlir::memref::CastOp>(op) || isConstLikeOp(&op)) {
+        continue;
+      }
+      reason = "unsupported op in residual loop body";
+      return false;
+    }
+    if (!sawStore) {
+      reason = "no store in residual loop";
+      return false;
+    }
+    return true;
+  }
+}
+
+static bool isWithinResidualLoop(
+    mlir::Operation *op,
+    llvm::ArrayRef<mlir::scf::ForOp> residualOuters) {
+  for (auto loop : residualOuters) {
+    if (loop->isAncestor(op)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static void analyzeResidualCopyBoundary(
+    mlir::func::FuncOp func, mlir::Neptune::NeptuneIR::ApplyOp apply,
+    ApplyStencilInfo &info) {
+  llvm::SmallVector<mlir::scf::ForOp, 4> residualLoops;
+  bool sawResidual = false;
+  bool ok = true;
+  std::string reason;
+
+  func.walk([&](mlir::scf::ForOp op) {
+    if (apply->isAncestor(op))
+      return;
+    auto parent = op->getParentOfType<mlir::scf::ForOp>();
+    if (parent && !apply->isAncestor(parent))
+      return;
+    residualLoops.push_back(op);
+  });
+
+  func.walk([&](mlir::scf::IfOp op) {
+    if (!apply->isAncestor(op)) {
+      sawResidual = true;
+      ok = false;
+      if (reason.empty())
+        reason = "residual scf.if";
+    }
+  });
+
+  llvm::SmallVector<CopyPairInfo, 4> pairs;
+  for (auto loop : residualLoops) {
+    sawResidual = true;
+    std::string loopReason;
+    if (!collectCopyPairsFromLoopNest(loop, pairs, loopReason)) {
+      ok = false;
+      if (reason.empty())
+        reason = loopReason;
       break;
     }
-    if (!inner) {
-      continue;
-    }
-
-    int64_t lbJ = 0;
-    int64_t ubJ = 0;
-    int64_t stepJ = 0;
-    if (!matchConstantIndex(inner.getLowerBound(), lbJ) ||
-        !matchConstantIndex(inner.getUpperBound(), ubJ) ||
-        !matchConstantIndex(inner.getStep(), stepJ) || stepJ != 1) {
-      continue;
-    }
-
-    mlir::memref::StoreOp store;
-    mlir::Block &innerBody = *inner.getBody();
-    for (mlir::Operation &op : innerBody.getOperations()) {
-      if (auto s = llvm::dyn_cast<mlir::memref::StoreOp>(op)) {
-        if (store) {
-          store = nullptr;
-          break;
-        }
-        store = s;
-        continue;
-      }
-      if (llvm::isa<mlir::memref::LoadOp, mlir::arith::AddIOp,
-                    mlir::arith::SubIOp, mlir::arith::ConstantOp,
-                    mlir::scf::YieldOp>(op)) {
-        continue;
-      }
-      store = nullptr;
-      break;
-    }
-    if (!store) {
-      continue;
-    }
-    if (store.getIndices().size() != 2) {
-      continue;
-    }
-    if (store.getIndices()[0] != outer.getInductionVar() ||
-        store.getIndices()[1] != inner.getInductionVar()) {
-      continue;
-    }
-
-    auto blockArg = llvm::dyn_cast<mlir::BlockArgument>(store.getMemref());
-    if (!blockArg || blockArg.getOwner() != &func.getBody().front()) {
-      continue;
-    }
-
-    StencilBounds bounds;
-    bounds.lbI = lbI;
-    bounds.ubI = ubI;
-    bounds.lbJ = lbJ;
-    bounds.ubJ = ubJ;
-    bounds.outputArgIndex = blockArg.getArgNumber();
-    return bounds;
   }
 
-  return std::nullopt;
+  if (ok) {
+    func.walk([&](mlir::Operation *op) {
+      if (op == func.getOperation())
+        return;
+      if (apply->isAncestor(op))
+        return;
+      if (isWithinResidualLoop(op, residualLoops))
+        return;
+      if (op->hasTrait<mlir::OpTrait::IsTerminator>())
+        return;
+      if (llvm::isa<mlir::Neptune::NeptuneIR::ApplyOp,
+                    mlir::Neptune::NeptuneIR::WrapOp,
+                    mlir::Neptune::NeptuneIR::LoadOp,
+                    mlir::Neptune::NeptuneIR::StoreOp>(op)) {
+        return;
+      }
+      if (llvm::isa<mlir::scf::ForOp, mlir::scf::IfOp>(op)) {
+        sawResidual = true;
+        ok = false;
+        if (reason.empty())
+          reason = "unsupported residual scf op";
+        return;
+      }
+      if (isConstLikeOp(op) || llvm::isa<mlir::memref::CastOp>(op)) {
+        return;
+      }
+      sawResidual = true;
+      ok = false;
+      if (reason.empty())
+        reason = "unsupported residual op";
+    });
+  }
+
+  info.hasResidualScf = sawResidual;
+  if (!sawResidual) {
+    info.residualCopyBoundary = false;
+    return;
+  }
+  if (ok && !pairs.empty()) {
+    info.residualCopyBoundary = true;
+    info.copyPairs = std::move(pairs);
+    return;
+  }
+  info.residualCopyBoundary = false;
+  if (!reason.empty()) {
+    info.residualReason = reason;
+  }
 }
 
 static std::optional<ApplyStencilInfo>
@@ -194,6 +447,8 @@ inferStencilFromApply(mlir::ModuleOp module, mlir::func::FuncOp func) {
   }
 
   mlir::PassManager pm(clone.getContext());
+  pm.addNestedPass<mlir::func::FuncOp>(
+      mlir::Neptune::NeptuneIR::createSCFBoundarySimplifyPass());
   pm.addNestedPass<mlir::func::FuncOp>(
       mlir::Neptune::NeptuneIR::createSCFToNeptuneIRPass());
   if (mlir::failed(pm.run(clone))) {
@@ -257,6 +512,46 @@ inferStencilFromApply(mlir::ModuleOp module, mlir::func::FuncOp func) {
   if (info.radius.size() != info.lb.size()) {
     return std::nullopt;
   }
+
+  for (mlir::Value input : apply.getInputs()) {
+    auto load = input.getDefiningOp<mlir::Neptune::NeptuneIR::LoadOp>();
+    if (!load)
+      return std::nullopt;
+    auto wrap =
+        load.getVarField().getDefiningOp<mlir::Neptune::NeptuneIR::WrapOp>();
+    if (!wrap)
+      return std::nullopt;
+    auto memref = wrap.getBuffer();
+    auto arg = llvm::dyn_cast<mlir::BlockArgument>(memref);
+    if (!arg || arg.getOwner() != &clonedFunc.getBody().front())
+      return std::nullopt;
+    info.applyInputArgs.push_back(arg.getArgNumber());
+  }
+
+  mlir::Neptune::NeptuneIR::StoreOp store;
+  bool multipleStores = false;
+  clonedFunc.walk([&](mlir::Neptune::NeptuneIR::StoreOp op) {
+    if (op.getValue() != apply.getResult())
+      return;
+    if (store) {
+      multipleStores = true;
+      return;
+    }
+    store = op;
+  });
+  if (!store || multipleStores)
+    return std::nullopt;
+  auto wrap =
+      store.getVarField().getDefiningOp<mlir::Neptune::NeptuneIR::WrapOp>();
+  if (!wrap)
+    return std::nullopt;
+  auto memref = wrap.getBuffer();
+  auto arg = llvm::dyn_cast<mlir::BlockArgument>(memref);
+  if (!arg || arg.getOwner() != &clonedFunc.getBody().front())
+    return std::nullopt;
+  info.applyOutputArg = arg.getArgNumber();
+
+  analyzeResidualCopyBoundary(clonedFunc, apply, info);
 
   return info;
 }
@@ -383,12 +678,32 @@ static bool parsePortMapEntry(llvm::StringRef entry, PortInfo &out,
   return true;
 }
 
+static const PortInfo *findPortByArgIndex(const KernelInfo &info,
+                                          unsigned argIndex) {
+  for (const auto &port : info.ports) {
+    if (port.argIndex == argIndex) {
+      return &port;
+    }
+  }
+  return nullptr;
+}
+
+static bool isHalideArg(const KernelInfo &info, unsigned argIndex) {
+  for (unsigned arg : info.halideArgs) {
+    if (arg == argIndex) {
+      return true;
+    }
+  }
+  return false;
+}
+
 static bool collectKernelInfos(const EventDB &db,
                                llvm::SmallVectorImpl<KernelInfo> &out) {
   if (!db.kernelModule) {
     return true;
   }
 
+  std::string boundaryCopyMode = parseBoundaryCopyMode();
   llvm::StringSet<> seenTags;
   mlir::ModuleOp module = db.kernelModule.get();
   for (auto func : module.getOps<mlir::func::FuncOp>()) {
@@ -471,28 +786,69 @@ static bool collectKernelInfos(const EventDB &db,
     info.halideCompatible = false;
     const PortInfo *inPort = nullptr;
     const PortInfo *outPort = nullptr;
-    if (info.numInputs == 1 && info.numOutputs == 1 && info.ports.size() == 2) {
-      for (const auto &port : info.ports) {
-        if (port.isInput) {
-          inPort = &port;
-        } else {
-          outPort = &port;
+    auto applyInfo = inferStencilFromApply(module, func);
+    if (applyInfo && applyInfo->applyOutputArg &&
+        !applyInfo->applyInputArgs.empty()) {
+      bool ok = true;
+      for (unsigned arg : applyInfo->applyInputArgs) {
+        const PortInfo *p = findPortByArgIndex(info, arg);
+        if (!p || !p->isInput) {
+          ok = false;
+          break;
         }
       }
-      if (inPort && outPort && inPort->rank == outPort->rank &&
-          inPort->rank > 0) {
-        info.halideCompatible = true;
+      const PortInfo *outCandidate =
+          findPortByArgIndex(info, *applyInfo->applyOutputArg);
+      if (!outCandidate || outCandidate->isInput) {
+        ok = false;
+      }
+      if (ok) {
+        inPort = findPortByArgIndex(info, applyInfo->applyInputArgs.front());
+        outPort = outCandidate;
+        if (inPort && outPort && inPort->rank == outPort->rank &&
+            inPort->rank > 0) {
+          bool rankOk = true;
+          for (unsigned arg : applyInfo->applyInputArgs) {
+            const PortInfo *p = findPortByArgIndex(info, arg);
+            if (!p || p->rank != outPort->rank) {
+              rankOk = false;
+              break;
+            }
+          }
+          bool shapeOk = rankOk;
+          if (shapeOk) {
+            for (unsigned arg : applyInfo->applyInputArgs) {
+              const PortInfo *p = findPortByArgIndex(info, arg);
+              if (!p || p->shape != outPort->shape) {
+                shapeOk = false;
+                break;
+              }
+            }
+          }
+          if (shapeOk) {
+            info.halideCompatible = true;
+            info.halideArgs.assign(applyInfo->applyInputArgs.begin(),
+                                   applyInfo->applyInputArgs.end());
+            info.halideArgs.push_back(*applyInfo->applyOutputArg);
+          }
+        }
       }
     }
 
     if (info.halideCompatible && inPort && outPort) {
       bool boundsFromApply = false;
-      bool boundsFromScf = false;
+      bool applyHasResidualScf = false;
+      bool applyResidualCopy = false;
+      std::string residualReason;
+      llvm::SmallVector<CopyPairInfo, 4> residualPairs;
       llvm::SmallVector<int64_t, 4> radius;
       std::string radiusSource;
 
-      auto applyInfo = inferStencilFromApply(module, func);
       if (applyInfo) {
+        applyHasResidualScf = applyInfo->hasResidualScf;
+        applyResidualCopy = applyInfo->residualCopyBoundary;
+        residualReason = applyInfo->residualReason;
+        residualPairs = applyInfo->copyPairs;
         if (applyInfo->lb.size() == outPort->rank &&
             applyInfo->ub.size() == outPort->rank) {
           bool ok = true;
@@ -516,25 +872,6 @@ static bool collectKernelInfos(const EventDB &db,
         }
       }
 
-      if (!boundsFromApply && outPort->rank == 2) {
-        auto bounds = findStencilBounds(func);
-        if (bounds && outPort->argIndex == bounds->outputArgIndex &&
-            outPort->shape.size() == 2) {
-          int64_t lbI = bounds->lbI;
-          int64_t ubI = bounds->ubI;
-          int64_t lbJ = bounds->lbJ;
-          int64_t ubJ = bounds->ubJ;
-          if (lbI >= 0 && lbJ >= 0 && ubI > lbI && ubJ > lbJ) {
-            info.hasOutputBounds = true;
-            info.outMin.assign({lbI, lbJ});
-            info.outExtent.assign({ubI - lbI, ubJ - lbJ});
-            radius.assign(outPort->rank, 1);
-            radiusSource = "default";
-            boundsFromScf = true;
-          }
-        }
-      }
-
       if (info.hasOutputBounds) {
         if (radius.size() != outPort->rank) {
           llvm::errs()
@@ -551,13 +888,74 @@ static bool collectKernelInfos(const EventDB &db,
           info.boundsValid = true;
           info.radius = std::move(radius);
           info.radiusSource = radiusSource;
-          info.boundsSource = boundsFromApply ? "neptune.ir.apply" : "scf.for";
+          info.boundsSource = boundsFromApply ? "neptune.ir.apply" : "";
+          info.hasResidualScf = applyHasResidualScf;
           if (boundsFromApply) {
             llvm::outs() << "neptune-cc: bounds from neptune.ir.apply for '"
                          << tag << "'\n";
-          } else if (boundsFromScf) {
-            llvm::outs() << "neptune-cc: fallback bounds from scf.for for '"
-                         << tag << "'\n";
+          }
+          if (boundsFromApply && applyHasResidualScf) {
+            if (applyResidualCopy && !residualPairs.empty()) {
+              bool ok = true;
+              for (const auto &pair : residualPairs) {
+                const PortInfo *pairIn =
+                    findPortByArgIndex(info, pair.inArgIndex);
+                const PortInfo *pairOut =
+                    findPortByArgIndex(info, pair.outArgIndex);
+                if (!pairIn || !pairOut) {
+                  ok = false;
+                  residualReason = "copy pair not in port_map";
+                  break;
+                }
+                if (pairIn->rank != pairOut->rank) {
+                  ok = false;
+                  residualReason = "copy pair rank mismatch";
+                  break;
+                }
+                if (pairIn->rank < 1) {
+                  ok = false;
+                  residualReason = "copy pair rank unsupported";
+                  break;
+                }
+                if (pairIn->rank > 3 && boundaryCopyMode != "whole") {
+                  ok = false;
+                  residualReason = "rank>3 requires NEPTUNECC_BOUNDARY_COPY_MODE=whole";
+                  break;
+                }
+                if (pairIn->shape != pairOut->shape) {
+                  ok = false;
+                  residualReason = "copy pair shape mismatch";
+                  break;
+                }
+                if (pair.outArgIndex != outPort->argIndex &&
+                    !pair.fullDomain) {
+                  ok = false;
+                  residualReason = "copy pair not full domain";
+                  break;
+                }
+              }
+              if (ok) {
+                info.partialCopyBoundary = true;
+                info.copyPairs = std::move(residualPairs);
+                info.boundaryCopyMode = boundaryCopyMode;
+              } else {
+                info.boundsValid = false;
+                info.partialCopyBoundary = false;
+                info.residualReason =
+                    residualReason.empty()
+                        ? "residual scf not copy-boundary"
+                        : residualReason;
+                logKernelSummary(info, *inPort, llvm::outs());
+                logResidualDecision(info, llvm::outs());
+              }
+            } else {
+              info.boundsValid = false;
+              info.residualReason =
+                  residualReason.empty() ? "residual scf not copy-boundary"
+                                         : residualReason;
+              logKernelSummary(info, *inPort, llvm::outs());
+              logResidualDecision(info, llvm::outs());
+            }
           }
         }
       }
@@ -566,6 +964,13 @@ static bool collectKernelInfos(const EventDB &db,
         llvm::errs()
             << "neptune-cc: no valid stencil bounds for kernel '" << tag
             << "', skipping glue/rewrite\n";
+        if (info.hasResidualScf && !info.partialCopyBoundary) {
+          llvm::errs() << "neptune-cc: residual scf not eligible: "
+                       << (info.residualReason.empty()
+                               ? "unknown reason"
+                               : info.residualReason)
+                       << "\n";
+        }
       }
     }
 
@@ -586,31 +991,28 @@ static bool collectKernelInfos(const EventDB &db,
   return true;
 }
 
-static std::string formatArrayArg(llvm::StringRef name, unsigned rank) {
+static void emitArrayArg(llvm::raw_ostream &os, llvm::StringRef name,
+                         unsigned rank) {
   if (rank <= 1) {
-    return name.str();
+    os << name;
+    return;
   }
-  std::string out = "&";
-  out.append(name.str());
+  os << "&" << name;
   for (unsigned i = 0; i < rank; ++i) {
-    out.append("[0]");
+    os << "[0]";
   }
-  return out;
 }
 
-static std::string buildKernelCall(const KernelInfo &info) {
-  std::string call = "neptunecc::";
-  call.append(info.tag);
-  call.push_back('(');
+static void emitKernelCall(llvm::raw_ostream &os, const KernelInfo &info) {
+  os << "neptunecc::" << info.tag << "(";
   for (size_t i = 0; i < info.ports.size(); ++i) {
     if (i > 0) {
-      call.append(", ");
+      os << ", ";
     }
     const auto &port = info.ports[i];
-    call.append(formatArrayArg(port.name, port.rank));
+    emitArrayArg(os, port.name, port.rank);
   }
-  call.append(");");
-  return call;
+  os << ");";
 }
 
 static size_t findLineStart(llvm::StringRef content, size_t offset) {
@@ -706,75 +1108,462 @@ static void ensureKernelInclude(std::string &content) {
   content.insert(insertPos, includeLine);
 }
 
+static void logResidualDecision(const KernelInfo &info,
+                                llvm::raw_ostream &os) {
+  if (info.hasResidualScf) {
+    os << "neptune-cc:   residual_scf=yes";
+    if (info.partialCopyBoundary) {
+      os << " copy_boundary=yes decision=PartialRewrite";
+      if (!info.boundaryCopyMode.empty()) {
+        os << " mode=" << info.boundaryCopyMode;
+      }
+      os << "\n";
+      os << "neptune-cc:   copy_pairs=" << info.copyPairs.size() << " [";
+      for (size_t i = 0; i < info.copyPairs.size(); ++i) {
+        const auto &pair = info.copyPairs[i];
+        const PortInfo *inPortPair = findPortByArgIndex(info, pair.inArgIndex);
+        const PortInfo *outPortPair =
+            findPortByArgIndex(info, pair.outArgIndex);
+        if (i > 0) {
+          os << ", ";
+        }
+        os << "arg" << pair.inArgIndex << "->arg" << pair.outArgIndex;
+        if (inPortPair && outPortPair) {
+          os << "(" << inPortPair->name << "->" << outPortPair->name << ")";
+        }
+        if (!pair.fullDomain) {
+          os << ":partial";
+        }
+      }
+      os << "]\n";
+    } else {
+      os << " copy_boundary=no decision=SkipRewrite";
+      if (!info.residualReason.empty()) {
+        os << " reason=" << info.residualReason;
+      }
+      os << "\n";
+    }
+  } else {
+    os << "neptune-cc:   residual_scf=no decision=PureHalide\n";
+  }
+}
+
+static void logKernelSummary(const KernelInfo &info, const PortInfo &shapePort,
+                             llvm::raw_ostream &os) {
+  os << "neptune-cc: glue kernel '" << info.tag << "'\n";
+  os << "neptune-cc:   rank=" << shapePort.rank << " shape=";
+  printI64Array(os, shapePort.shape);
+  if (!info.boundsSource.empty()) {
+    os << " bounds=" << info.boundsSource;
+  }
+  if (!info.radiusSource.empty()) {
+    os << " radius_source=" << info.radiusSource;
+  }
+  os << "\n";
+  os << "neptune-cc:   outMin=";
+  printI64Array(os, info.outMin);
+  os << " outExtent=";
+  printI64Array(os, info.outExtent);
+  os << " radius=";
+  printI64Array(os, info.radius);
+  os << "\n";
+  if (info.radiusSource == "default") {
+    os << "neptune-cc:   radius defaulted to 1\n";
+  }
+}
+
+static void emitKernelSignature(llvm::raw_ostream &os,
+                                const KernelInfo &kernel) {
+  os << "int " << kernel.tag << "(";
+  for (size_t i = 0; i < kernel.ports.size(); ++i) {
+    if (i > 0) {
+      os << ", ";
+    }
+    os << "int32_t* " << kernel.ports[i].name;
+  }
+  os << ")";
+}
+
 static bool writeGlueHeader(llvm::StringRef glueDir,
                             llvm::ArrayRef<KernelInfo> kernels) {
   std::string headerPath = joinPath(glueDir, {"neptunecc_kernels.h"});
-  std::ofstream os(headerPath);
-  if (!os.is_open()) {
+  std::error_code ec;
+  llvm::raw_fd_ostream os(headerPath, ec, llvm::sys::fs::OF_Text);
+  if (ec) {
     llvm::errs() << "neptune-cc: failed to open glue header '"
-                 << headerPath << "'\n";
+                 << headerPath << "': " << ec.message() << "\n";
     return false;
   }
 
-  os << "#pragma once\n";
-  os << "#include <cstdint>\n";
-  os << "namespace neptunecc {\n";
+  CodeWriter w(os);
+  w.line("#pragma once");
+  w.line("#include <cstdint>");
+  w.line("namespace neptunecc {");
+  w.indent();
   for (const auto &kernel : kernels) {
     if (!kernel.halideCompatible || !kernel.boundsValid) {
       if (!kernel.halideCompatible) {
         llvm::errs() << "neptune-cc: skipping glue header for kernel '"
                      << kernel.tag
-                     << "' (requires single input/output with matching rank)\n";
+                     << "' (missing apply-mapped input/output)\n";
       } else {
         llvm::errs() << "neptune-cc: skipping glue header for kernel '"
                      << kernel.tag << "' (no valid stencil bounds)\n";
       }
       continue;
     }
-    os << "int " << kernel.tag << "(";
-    for (size_t i = 0; i < kernel.ports.size(); ++i) {
-      if (i > 0) {
-        os << ", ";
-      }
-      os << "int32_t* " << kernel.ports[i].name;
-    }
-    os << ");\n";
+    std::string sig;
+    llvm::raw_string_ostream sigStream(sig);
+    emitKernelSignature(sigStream, kernel);
+    sigStream << ";";
+    w.line(sigStream.str());
   }
-  os << "} // namespace neptunecc\n";
+  w.dedent();
+  w.line("} // namespace neptunecc");
   return true;
+}
+
+static void emitWholeCopyND(CodeWriter &w, const std::string &inName,
+                            const std::string &outName,
+                            llvm::ArrayRef<int64_t> shape) {
+  int64_t total = 1;
+  for (int64_t dim : shape) {
+    total *= dim;
+  }
+  w.line("// copy-boundary (whole domain)");
+  w.line(llvm::formatv("for (int64_t idx = 0; idx < {0}; ++idx) {{", total)
+             .str());
+  w.indent();
+  w.line(llvm::formatv("{0}[idx] = {1}[idx];", outName, inName).str());
+  w.dedent();
+  w.line("}");
+  w.line();
+}
+
+static void emitSlabCopy1D(CodeWriter &w, const std::string &inName,
+                           const std::string &outName,
+                           llvm::ArrayRef<int64_t> shape,
+                           llvm::ArrayRef<int64_t> outMin,
+                           llvm::ArrayRef<int64_t> outExtent) {
+  const int64_t n = shape[0];
+  const int64_t lb = outMin[0];
+  const int64_t ub = outMin[0] + outExtent[0];
+  w.line("// copy-boundary (slabs, 1D)");
+  if (lb > 0) {
+    w.line(llvm::formatv("for (int64_t i = 0; i < {0}; ++i) {{", lb).str());
+    w.indent();
+    w.line(llvm::formatv("{0}[i] = {1}[i];", outName, inName).str());
+    w.dedent();
+    w.line("}");
+  }
+  if (ub < n) {
+    w.line(llvm::formatv("for (int64_t i = {0}; i < {1}; ++i) {{", ub, n)
+               .str());
+    w.indent();
+    w.line(llvm::formatv("{0}[i] = {1}[i];", outName, inName).str());
+    w.dedent();
+    w.line("}");
+  }
+  w.line();
+}
+
+static void emitSlabCopy2D(CodeWriter &w, const std::string &inName,
+                           const std::string &outName,
+                           llvm::ArrayRef<int64_t> shape,
+                           llvm::ArrayRef<int64_t> outMin,
+                           llvm::ArrayRef<int64_t> outExtent) {
+  const int64_t h = shape[0];
+  const int64_t width = shape[1];
+  const int64_t i0 = outMin[0];
+  const int64_t i1 = outMin[0] + outExtent[0];
+  const int64_t j0 = outMin[1];
+  const int64_t j1 = outMin[1] + outExtent[1];
+  w.line("// copy-boundary (slabs, 2D)");
+  if (i0 > 0) {
+    w.line(llvm::formatv("for (int64_t i = 0; i < {0}; ++i) {{", i0).str());
+    w.indent();
+    w.line(
+        llvm::formatv("for (int64_t j = 0; j < {0}; ++j) {{", width).str());
+    w.indent();
+    w.line(llvm::formatv("{0}[i * {1} + j] = {2}[i * {1} + j];", outName,
+                         width, inName)
+               .str());
+    w.dedent();
+    w.line("}");
+    w.dedent();
+    w.line("}");
+  }
+  if (i1 < h) {
+    w.line(llvm::formatv("for (int64_t i = {0}; i < {1}; ++i) {{", i1, h)
+               .str());
+    w.indent();
+    w.line(
+        llvm::formatv("for (int64_t j = 0; j < {0}; ++j) {{", width).str());
+    w.indent();
+    w.line(llvm::formatv("{0}[i * {1} + j] = {2}[i * {1} + j];", outName,
+                         width, inName)
+               .str());
+    w.dedent();
+    w.line("}");
+    w.dedent();
+    w.line("}");
+  }
+  if (j0 > 0 && i1 > i0) {
+    w.line(llvm::formatv("for (int64_t i = {0}; i < {1}; ++i) {{", i0, i1)
+               .str());
+    w.indent();
+    w.line(llvm::formatv("for (int64_t j = 0; j < {0}; ++j) {{", j0).str());
+    w.indent();
+    w.line(llvm::formatv("{0}[i * {1} + j] = {2}[i * {1} + j];", outName,
+                         width, inName)
+               .str());
+    w.dedent();
+    w.line("}");
+    w.dedent();
+    w.line("}");
+  }
+  if (j1 < w && i1 > i0) {
+    w.line(llvm::formatv("for (int64_t i = {0}; i < {1}; ++i) {{", i0, i1)
+               .str());
+    w.indent();
+    w.line(
+        llvm::formatv("for (int64_t j = {0}; j < {1}; ++j) {{", j1, width)
+            .str());
+    w.indent();
+    w.line(llvm::formatv("{0}[i * {1} + j] = {2}[i * {1} + j];", outName,
+                         width, inName)
+               .str());
+    w.dedent();
+    w.line("}");
+    w.dedent();
+    w.line("}");
+  }
+  w.line();
+}
+
+static void emitSlabCopy3D(CodeWriter &w, const std::string &inName,
+                           const std::string &outName,
+                           llvm::ArrayRef<int64_t> shape,
+                           llvm::ArrayRef<int64_t> outMin,
+                           llvm::ArrayRef<int64_t> outExtent) {
+  const int64_t d0 = shape[0];
+  const int64_t d1 = shape[1];
+  const int64_t d2 = shape[2];
+  const int64_t i0 = outMin[0];
+  const int64_t i1 = outMin[0] + outExtent[0];
+  const int64_t j0 = outMin[1];
+  const int64_t j1 = outMin[1] + outExtent[1];
+  const int64_t k0 = outMin[2];
+  const int64_t k1 = outMin[2] + outExtent[2];
+  w.line("// copy-boundary (slabs, 3D)");
+  if (k0 > 0) {
+    w.line(llvm::formatv("for (int64_t i = 0; i < {0}; ++i) {{", d0).str());
+    w.indent();
+    w.line(llvm::formatv("for (int64_t j = 0; j < {0}; ++j) {{", d1).str());
+    w.indent();
+    w.line(llvm::formatv("for (int64_t k = 0; k < {0}; ++k) {{", k0).str());
+    w.indent();
+    w.line(llvm::formatv("{0}[((i * {1}) + j) * {2} + k] = {3}[((i * {1}) + j) * {2} + k];",
+                         outName, d1, d2, inName)
+               .str());
+    w.dedent();
+    w.line("}");
+    w.dedent();
+    w.line("}");
+    w.dedent();
+    w.line("}");
+  }
+  if (k1 < d2) {
+    w.line(llvm::formatv("for (int64_t i = 0; i < {0}; ++i) {{", d0).str());
+    w.indent();
+    w.line(llvm::formatv("for (int64_t j = 0; j < {0}; ++j) {{", d1).str());
+    w.indent();
+    w.line(llvm::formatv("for (int64_t k = {0}; k < {1}; ++k) {{", k1, d2)
+               .str());
+    w.indent();
+    w.line(llvm::formatv("{0}[((i * {1}) + j) * {2} + k] = {3}[((i * {1}) + j) * {2} + k];",
+                         outName, d1, d2, inName)
+               .str());
+    w.dedent();
+    w.line("}");
+    w.dedent();
+    w.line("}");
+    w.dedent();
+    w.line("}");
+  }
+  if (j0 > 0 && k1 > k0) {
+    w.line(llvm::formatv("for (int64_t i = 0; i < {0}; ++i) {{", d0).str());
+    w.indent();
+    w.line(llvm::formatv("for (int64_t j = 0; j < {0}; ++j) {{", j0).str());
+    w.indent();
+    w.line(llvm::formatv("for (int64_t k = {0}; k < {1}; ++k) {{", k0, k1)
+               .str());
+    w.indent();
+    w.line(llvm::formatv("{0}[((i * {1}) + j) * {2} + k] = {3}[((i * {1}) + j) * {2} + k];",
+                         outName, d1, d2, inName)
+               .str());
+    w.dedent();
+    w.line("}");
+    w.dedent();
+    w.line("}");
+    w.dedent();
+    w.line("}");
+  }
+  if (j1 < d1 && k1 > k0) {
+    w.line(llvm::formatv("for (int64_t i = 0; i < {0}; ++i) {{", d0).str());
+    w.indent();
+    w.line(llvm::formatv("for (int64_t j = {0}; j < {1}; ++j) {{", j1, d1)
+               .str());
+    w.indent();
+    w.line(llvm::formatv("for (int64_t k = {0}; k < {1}; ++k) {{", k0, k1)
+               .str());
+    w.indent();
+    w.line(llvm::formatv("{0}[((i * {1}) + j) * {2} + k] = {3}[((i * {1}) + j) * {2} + k];",
+                         outName, d1, d2, inName)
+               .str());
+    w.dedent();
+    w.line("}");
+    w.dedent();
+    w.line("}");
+    w.dedent();
+    w.line("}");
+  }
+  if (i0 > 0 && j1 > j0 && k1 > k0) {
+    w.line(llvm::formatv("for (int64_t i = 0; i < {0}; ++i) {{", i0).str());
+    w.indent();
+    w.line(llvm::formatv("for (int64_t j = {0}; j < {1}; ++j) {{", j0, j1)
+               .str());
+    w.indent();
+    w.line(llvm::formatv("for (int64_t k = {0}; k < {1}; ++k) {{", k0, k1)
+               .str());
+    w.indent();
+    w.line(llvm::formatv("{0}[((i * {1}) + j) * {2} + k] = {3}[((i * {1}) + j) * {2} + k];",
+                         outName, d1, d2, inName)
+               .str());
+    w.dedent();
+    w.line("}");
+    w.dedent();
+    w.line("}");
+    w.dedent();
+    w.line("}");
+  }
+  if (i1 < d0 && j1 > j0 && k1 > k0) {
+    w.line(llvm::formatv("for (int64_t i = {0}; i < {1}; ++i) {{", i1, d0)
+               .str());
+    w.indent();
+    w.line(llvm::formatv("for (int64_t j = {0}; j < {1}; ++j) {{", j0, j1)
+               .str());
+    w.indent();
+    w.line(llvm::formatv("for (int64_t k = {0}; k < {1}; ++k) {{", k0, k1)
+               .str());
+    w.indent();
+    w.line(llvm::formatv("{0}[((i * {1}) + j) * {2} + k] = {3}[((i * {1}) + j) * {2} + k];",
+                         outName, d1, d2, inName)
+               .str());
+    w.dedent();
+    w.line("}");
+    w.dedent();
+    w.line("}");
+    w.dedent();
+    w.line("}");
+  }
+  w.line();
+}
+
+struct DimSpec {
+  int64_t min = 0;
+  int64_t extent = 0;
+  int64_t stride = 0;
+};
+
+static void emitDimsTemplateAndInit(CodeWriter &w, llvm::StringRef kernelTag,
+                                    llvm::StringRef prefix, unsigned roleIndex,
+                                    unsigned rank,
+                                    llvm::ArrayRef<DimSpec> dims,
+                                    int64_t offsetElems) {
+  std::string base =
+      llvm::formatv("{0}_{1}{2}", kernelTag, prefix, roleIndex).str();
+  std::string dimsName = base + "_dims";
+  std::string templName = base + "_templ";
+
+  w.line(llvm::formatv("static const halide_dimension_t {0}[{1}] = {{",
+                       dimsName, rank)
+             .str());
+  w.indent();
+  for (size_t i = 0; i < dims.size(); ++i) {
+    const DimSpec &d = dims[i];
+    llvm::StringRef comma = (i + 1 < dims.size()) ? "," : "";
+    w.line(llvm::formatv("{{{0}, {1}, {2}, 0}}{3}", d.min, d.extent, d.stride,
+                         comma)
+               .str());
+  }
+  w.dedent();
+  w.line("};");
+  w.line(llvm::formatv("static const halide_buffer_t {0} = {{", templName)
+             .str());
+  w.indent();
+  w.line("0,");
+  w.line("nullptr,");
+  w.line("nullptr,");
+  w.line("0,");
+  w.line("k_i32_type,");
+  w.line(llvm::formatv("{0},", rank).str());
+  w.line(llvm::formatv("const_cast<halide_dimension_t*>({0}),", dimsName).str());
+  w.line("nullptr");
+  w.dedent();
+  w.line("};");
+  w.line();
+  w.line(llvm::formatv("static inline void init_{0}(halide_buffer_t &buf, int32_t *base) {{",
+                       base)
+             .str());
+  w.indent();
+  w.line(llvm::formatv("buf = {0};", templName).str());
+  w.line(llvm::formatv("buf.host = reinterpret_cast<uint8_t*>(base + {0});",
+                       offsetElems)
+             .str());
+  w.dedent();
+  w.line("}");
+  w.line();
 }
 
 static bool writeGlueCpp(llvm::StringRef glueDir,
                          llvm::ArrayRef<KernelInfo> kernels) {
   std::string cppPath = joinPath(glueDir, {"neptunecc_kernels.cpp"});
-  std::ofstream os(cppPath);
-  if (!os.is_open()) {
+  std::error_code ec;
+  llvm::raw_fd_ostream os(cppPath, ec, llvm::sys::fs::OF_Text);
+  if (ec) {
     llvm::errs() << "neptune-cc: failed to open glue source '"
-                 << cppPath << "'\n";
+                 << cppPath << "': " << ec.message() << "\n";
     return false;
   }
 
-  os << "#include \"neptunecc_kernels.h\"\n";
-  os << "#include \"HalideRuntime.h\"\n";
+  CodeWriter w(os);
+  w.line("#include \"neptunecc_kernels.h\"");
+  w.line("#include \"HalideRuntime.h\"");
   for (const auto &kernel : kernels) {
     if (!kernel.halideCompatible || !kernel.boundsValid) {
       continue;
     }
-    os << "#include \"../halide/" << kernel.tag << ".h\"\n";
+    w.line(llvm::formatv("#include \"../halide/{0}.h\"", kernel.tag).str());
   }
-  os << "\nnamespace neptunecc {\n\n";
+  w.line();
+  w.line("namespace neptunecc {");
+  w.line();
 
-  os << "static inline halide_type_t i32_type() {\n";
-  os << "  halide_type_t t;\n";
-  os << "  t.code = halide_type_int;\n";
-  os << "  t.bits = 32;\n";
-  os << "  t.lanes = 1;\n";
-  os << "  return t;\n";
-  os << "}\n\n";
-  os << "static const halide_type_t k_i32_type = i32_type();\n\n";
-  os << "// dim0 corresponds to the last IR index (fastest varying),\n";
-  os << "// dim1 corresponds to the first IR index. offset_elems uses\n";
-  os << "// row-major: offset = sum(outMin[d] * stride[d]).\n\n";
+  w.openBlock("static inline halide_type_t i32_type() {");
+  w.line("halide_type_t t;");
+  w.line("t.code = halide_type_int;");
+  w.line("t.bits = 32;");
+  w.line("t.lanes = 1;");
+  w.line("return t;");
+  w.closeBlock("}");
+  w.line();
+  w.line("static const halide_type_t k_i32_type = i32_type();");
+  w.line();
+  w.line("// dim0 corresponds to the last IR index (fastest varying),");
+  w.line("// dim1 corresponds to the first IR index. offset_elems uses");
+  w.line("// row-major: offset = sum(outMin[d] * stride[d]).");
+  w.line();
   const char *ghostedEnv = std::getenv("NEPTUNECC_GHOSTED_BASE");
   const bool allowGhostedPolicy =
       ghostedEnv && ghostedEnv[0] != '\0' && ghostedEnv[0] != '0';
@@ -805,25 +1594,13 @@ static bool writeGlueCpp(llvm::StringRef glueDir,
                    << kernel.tag << "'\n";
       continue;
     }
-    llvm::outs() << "neptune-cc: glue kernel '" << kernel.tag << "'\n";
-    llvm::outs() << "neptune-cc:   rank=" << rank << " shape=";
-    printI64Array(llvm::outs(), inPort->shape);
-    if (!kernel.boundsSource.empty()) {
-      llvm::outs() << " bounds=" << kernel.boundsSource;
-    }
-    if (!kernel.radiusSource.empty()) {
-      llvm::outs() << " radius_source=" << kernel.radiusSource;
-    }
-    llvm::outs() << "\n";
-    llvm::outs() << "neptune-cc:   outMin=";
-    printI64Array(llvm::outs(), kernel.outMin);
-    llvm::outs() << " outExtent=";
-    printI64Array(llvm::outs(), kernel.outExtent);
-    llvm::outs() << " radius=";
-    printI64Array(llvm::outs(), kernel.radius);
-    llvm::outs() << "\n";
+    logKernelSummary(kernel, *inPort, llvm::outs());
+    logResidualDecision(kernel, llvm::outs());
 
     for (const auto &port : kernel.ports) {
+      if (!isHalideArg(kernel, port.argIndex)) {
+        continue;
+      }
       const char *prefix = port.isInput ? "in" : "out";
       llvm::SmallVector<int64_t, 4> strides(rank, 1);
       for (size_t i = rank; i-- > 1;) {
@@ -873,81 +1650,96 @@ static bool writeGlueCpp(llvm::StringRef glueDir,
         llvm::outs() << " host_offset_elems=" << offsetElems << "\n";
       }
 
-      os << "static const halide_dimension_t " << kernel.tag << "_" << prefix
-         << port.roleIndex << "_dims[" << rank << "] = {\n";
+      llvm::SmallVector<DimSpec, 4> dims;
+      dims.reserve(rank);
       for (size_t i = 0; i < rank; ++i) {
         size_t d = rank - 1 - i;
-        os << "  {" << static_cast<long long>(mins[d]) << ", "
-           << static_cast<long long>(extents[d]) << ", "
-           << static_cast<long long>(strides[d]) << ", 0}";
-        if (i + 1 < rank) {
-          os << ",";
+        dims.push_back(
+            DimSpec{mins[d], extents[d], strides[d]});
+      }
+      emitDimsTemplateAndInit(w, kernel.tag, prefix, port.roleIndex, rank, dims,
+                              offsetElems);
+    }
+
+    std::string signature;
+    llvm::raw_string_ostream sigStream(signature);
+    emitKernelSignature(sigStream, kernel);
+    sigStream << " {";
+    w.line(sigStream.str());
+    w.indent();
+
+    for (unsigned arg : kernel.halideArgs) {
+      const PortInfo *port = findPortByArgIndex(kernel, arg);
+      if (!port)
+        continue;
+      const char *prefix = port->isInput ? "in" : "out";
+      w.line(llvm::formatv("halide_buffer_t {0}{1}_buf;", prefix,
+                           port->roleIndex)
+                 .str());
+      w.line(llvm::formatv("init_{0}_{1}{2}({1}{2}_buf, {3});", kernel.tag,
+                           prefix, port->roleIndex, port->name)
+                 .str());
+    }
+
+    if (kernel.partialCopyBoundary) {
+      bool useWholeCopy = (kernel.boundaryCopyMode == "whole");
+      if (kernel.boundaryCopyMode.empty()) {
+        useWholeCopy = false;
+      }
+      for (const auto &pair : kernel.copyPairs) {
+        const PortInfo *pairIn = findPortByArgIndex(kernel, pair.inArgIndex);
+        const PortInfo *pairOut = findPortByArgIndex(kernel, pair.outArgIndex);
+        if (!pairIn || !pairOut)
+          continue;
+        if (useWholeCopy) {
+          emitWholeCopyND(w, pairIn->name, pairOut->name, pairIn->shape);
+        } else if (pairIn->rank == 1) {
+          emitSlabCopy1D(w, pairIn->name, pairOut->name, pairIn->shape,
+                         kernel.outMin, kernel.outExtent);
+        } else if (pairIn->rank == 2) {
+          emitSlabCopy2D(w, pairIn->name, pairOut->name, pairIn->shape,
+                         kernel.outMin, kernel.outExtent);
+        } else if (pairIn->rank == 3) {
+          emitSlabCopy3D(w, pairIn->name, pairOut->name, pairIn->shape,
+                         kernel.outMin, kernel.outExtent);
         }
-        os << "\n";
       }
-      os << "};\n";
-      os << "static const halide_buffer_t " << kernel.tag << "_" << prefix
-         << port.roleIndex << "_templ = {\n";
-      os << "  0,\n";
-      os << "  nullptr,\n";
-      os << "  nullptr,\n";
-      os << "  0,\n";
-      os << "  k_i32_type,\n";
-      os << "  " << rank << ",\n";
-      os << "  const_cast<halide_dimension_t*>(" << kernel.tag << "_" << prefix
-         << port.roleIndex << "_dims),\n";
-      os << "  nullptr\n";
-      os << "};\n\n";
-
-      os << "static inline void init_" << kernel.tag << "_" << prefix
-         << port.roleIndex << "(halide_buffer_t &buf, int32_t *base) {\n";
-      os << "  buf = " << kernel.tag << "_" << prefix << port.roleIndex
-         << "_templ;\n";
-      os << "  buf.host = reinterpret_cast<uint8_t*>(base + "
-         << static_cast<long long>(offsetElems) << ");\n";
-      os << "}\n\n";
     }
 
-    os << "int " << kernel.tag << "(";
-    for (size_t i = 0; i < kernel.ports.size(); ++i) {
-      if (i > 0) {
-        os << ", ";
+    std::string call;
+    llvm::raw_string_ostream callStream(call);
+    callStream << "return ::" << kernel.tag << "(";
+    bool firstArg = true;
+    for (unsigned arg : kernel.halideArgs) {
+      const PortInfo *port = findPortByArgIndex(kernel, arg);
+      if (!port)
+        continue;
+      if (!firstArg) {
+        callStream << ", ";
       }
-      os << "int32_t* " << kernel.ports[i].name;
+      firstArg = false;
+      const char *prefix = port->isInput ? "in" : "out";
+      callStream << "&" << prefix << port->roleIndex << "_buf";
     }
-    os << ") {\n";
-
-    for (const auto &port : kernel.ports) {
-      const char *prefix = port.isInput ? "in" : "out";
-      os << "  halide_buffer_t " << prefix << port.roleIndex << "_buf;\n";
-      os << "  init_" << kernel.tag << "_" << prefix << port.roleIndex << "("
-         << prefix << port.roleIndex << "_buf, " << port.name << ");\n";
-    }
-
-    os << "\n  return ::" << kernel.tag << "(";
-    for (size_t i = 0; i < kernel.ports.size(); ++i) {
-      if (i > 0) {
-        os << ", ";
-      }
-      const auto &port = kernel.ports[i];
-      const char *prefix = port.isInput ? "in" : "out";
-      os << "&" << prefix << port.roleIndex << "_buf";
-    }
-    os << ");\n";
-    os << "}\n\n";
+    callStream << ");";
+    w.line(callStream.str());
+    w.dedent();
+    w.line("}");
+    w.line();
   }
 
-  os << "} // namespace neptunecc\n";
+  w.line("} // namespace neptunecc");
   return true;
 }
 
 static bool writeGlueCMake(llvm::StringRef glueDir,
                            llvm::ArrayRef<KernelInfo> kernels) {
   std::string cmakePath = joinPath(glueDir, {"neptunecc_generated.cmake"});
-  std::ofstream os(cmakePath);
-  if (!os.is_open()) {
+  std::error_code ec;
+  llvm::raw_fd_ostream os(cmakePath, ec, llvm::sys::fs::OF_Text);
+  if (ec) {
     llvm::errs() << "neptune-cc: failed to open glue cmake '"
-                 << cmakePath << "'\n";
+                 << cmakePath << "': " << ec.message() << "\n";
     return false;
   }
 
@@ -966,7 +1758,7 @@ static bool writeGlueCMake(llvm::StringRef glueDir,
       if (!kernel.halideCompatible) {
         llvm::errs() << "neptune-cc: skipping CMake target for kernel '"
                      << kernel.tag
-                     << "' (requires single input/output with matching rank)\n";
+                     << "' (missing apply-mapped input/output)\n";
       } else {
         llvm::errs() << "neptune-cc: skipping CMake target for kernel '"
                      << kernel.tag << "' (no valid stencil bounds)\n";
@@ -995,10 +1787,11 @@ static bool writeGlueCMake(llvm::StringRef glueDir,
 static bool writeHalideHelperFile(llvm::StringRef halideDir) {
   std::string helperPath =
       joinPath(halideDir, {"NeptuneHalideHelpers.h"});
-  std::ofstream os(helperPath);
-  if (!os.is_open()) {
+  std::error_code ec;
+  llvm::raw_fd_ostream os(helperPath, ec, llvm::sys::fs::OF_Text);
+  if (ec) {
     llvm::errs() << "neptune-cc: failed to open Halide helper header '"
-                 << helperPath << "'\n";
+                 << helperPath << "': " << ec.message() << "\n";
     return false;
   }
 
@@ -1092,7 +1885,7 @@ bool rewriteKernelSources(const EventDB &db, llvm::StringRef outDir) {
     if (!it->second->halideCompatible || !it->second->boundsValid) {
       if (!it->second->halideCompatible) {
         llvm::errs() << "neptune-cc: skipping rewrite for kernel '" << tag
-                     << "' (requires single input/output with matching rank)\n";
+                     << "' (missing apply-mapped input/output)\n";
       } else {
         llvm::errs() << "neptune-cc: skipping rewrite for kernel '" << tag
                      << "' (no valid stencil bounds)\n";
@@ -1140,9 +1933,10 @@ bool rewriteKernelSources(const EventDB &db, llvm::StringRef outDir) {
     Replacement repl;
     repl.start = start;
     repl.end = end;
-    repl.text = indent.str();
-    repl.text.append(buildKernelCall(*it->second));
-    repl.text.append(newline);
+    llvm::raw_string_ostream rso(repl.text);
+    rso << indent;
+    emitKernelCall(rso, *it->second);
+    rso << newline;
     replacementsByFile[filePath].push_back(std::move(repl));
   }
 
@@ -1188,10 +1982,11 @@ bool rewriteKernelSources(const EventDB &db, llvm::StringRef outDir) {
 
     llvm::SmallString<256> outPath(rewriteDir);
     llvm::sys::path::append(outPath, llvm::sys::path::filename(filePath));
-    std::ofstream os(outPath.str().str());
-    if (!os.is_open()) {
+    std::error_code ec;
+    llvm::raw_fd_ostream os(outPath, ec, llvm::sys::fs::OF_Text);
+    if (ec) {
       llvm::errs() << "neptune-cc: failed to write rewritten source '"
-                   << outPath << "'\n";
+                   << outPath << "': " << ec.message() << "\n";
       return false;
     }
     os << content;
@@ -1219,6 +2014,8 @@ bool writeHalideGenerators(const EventDB &db, llvm::StringRef outDir,
 
   mlir::PassManager pm(ctx);
   pm.addNestedPass<mlir::func::FuncOp>(
+      mlir::Neptune::NeptuneIR::createSCFBoundarySimplifyPass());
+  pm.addNestedPass<mlir::func::FuncOp>(
       mlir::Neptune::NeptuneIR::createSCFToNeptuneIRPass());
   mlir::Neptune::NeptuneIR::NeptuneIREmitCHalidePassOptions opts;
   opts.outFile = "halide_kernels";
@@ -1231,28 +2028,29 @@ bool writeHalideGenerators(const EventDB &db, llvm::StringRef outDir,
 
   if (emitEmitcMLIR) {
     std::string emitcPath = joinPath(halideDir, {"emitc.mlir"});
-    std::ofstream emitcFile(emitcPath);
-    if (!emitcFile.is_open()) {
+    std::error_code ec;
+    llvm::raw_fd_ostream emitcFile(emitcPath, ec, llvm::sys::fs::OF_Text);
+    if (ec) {
       llvm::errs() << "neptune-cc: failed to open emitc mlir '"
-                   << emitcPath << "'\n";
+                   << emitcPath << "': " << ec.message() << "\n";
       return false;
     }
-    llvm::raw_os_ostream os(emitcFile);
-    module.print(os);
-    os << "\n";
+    module.print(emitcFile);
+    emitcFile << "\n";
   }
 
   if (emitHalideCpp) {
     std::string cppPath = joinPath(halideDir, {"halide_kernels.cpp"});
-    std::ofstream cppFile(cppPath);
-    if (!cppFile.is_open()) {
+    std::error_code ec;
+    llvm::raw_fd_ostream cppFile(cppPath, ec, llvm::sys::fs::OF_Text);
+    if (ec) {
       llvm::errs() << "neptune-cc: failed to open halide cpp '" << cppPath
-                   << "'\n";
+                   << "': " << ec.message() << "\n";
       return false;
     }
-    llvm::raw_os_ostream os(cppFile);
     if (mlir::failed(
-            mlir::emitc::translateToCpp(module, os, false, "halide_kernels"))) {
+            mlir::emitc::translateToCpp(module, cppFile, false,
+                                        "halide_kernels"))) {
       llvm::errs() << "neptune-cc: failed to translate emitc to C++\n";
       return false;
     }
