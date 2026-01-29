@@ -3,14 +3,14 @@
 #include <cstdio>
 #include <vector>
 
-#define H 512
-#define W 512
+#define H 2048
+#define W 2048
 
 void case_big2d_kernel(int32_t x[H][W], int32_t y[H][W]) {
 #pragma neptune kernel begin tag(k0) name(k0) dm(da) in(x:ghosted) out(y:owned)
   {
-    for (int i = 1; i < 511; ++i) {
-      for (int j = 1; j < 511; ++j) {
+    for (int i = 1; i < H - 1; ++i) {
+      for (int j = 1; j < W - 1; ++j) {
         y[i][j] = x[i][j] + x[i - 1][j] + x[i + 1][j] + x[i][j - 1] +
                   x[i][j + 1];
       }
@@ -38,7 +38,7 @@ int main() {
   auto *x2 = reinterpret_cast<int32_t (*)[W]>(x.data());
   auto *y2 = reinterpret_cast<int32_t (*)[W]>(y.data());
 
-  const int iters = 200;
+  const int iters = 2000;
   int64_t sum = 0;
   auto start = std::chrono::high_resolution_clock::now();
   for (int iter = 0; iter < iters; ++iter) {

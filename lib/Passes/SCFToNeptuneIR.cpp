@@ -31,6 +31,10 @@ namespace mlir::Neptune::NeptuneIR {
 #include "Passes/NeptuneIRPasses.h.inc"
 } // namespace mlir::Neptune::NeptuneIR
 
+struct OffsetKey1 {
+  int64_t di;
+};
+
 struct OffsetKey {
   int64_t di;
   int64_t dj;
@@ -43,6 +47,22 @@ struct OffsetKey3 {
 };
 
 namespace llvm {
+template <>
+struct DenseMapInfo<OffsetKey1> {
+  static inline OffsetKey1 getEmptyKey() {
+    return OffsetKey1{std::numeric_limits<int64_t>::min()};
+  }
+  static inline OffsetKey1 getTombstoneKey() {
+    return OffsetKey1{std::numeric_limits<int64_t>::min() + 1};
+  }
+  static unsigned getHashValue(const OffsetKey1 &k) {
+    return llvm::hash_combine(k.di);
+  }
+  static bool isEqual(const OffsetKey1 &a, const OffsetKey1 &b) {
+    return a.di == b.di;
+  }
+};
+
 template <>
 struct DenseMapInfo<OffsetKey> {
   static inline OffsetKey getEmptyKey() {
@@ -86,14 +106,41 @@ namespace {
 using namespace mlir::Neptune::NeptuneIR;
 
 static bool matchConstantIndex(Value v, int64_t &out) {
-  auto cst = v.getDefiningOp<arith::ConstantOp>();
-  if (!cst || !cst.getType().isIndex())
-    return false;
-  auto attr = dyn_cast<IntegerAttr>(cst.getValue());
-  if (!attr)
-    return false;
-  out = attr.getInt();
-  return true;
+  if (auto cst = v.getDefiningOp<arith::ConstantOp>()) {
+    if (!cst.getType().isIndex())
+      return false;
+    auto attr = dyn_cast<IntegerAttr>(cst.getValue());
+    if (!attr)
+      return false;
+    out = attr.getInt();
+    return true;
+  }
+
+  if (auto addi = v.getDefiningOp<arith::AddIOp>()) {
+    if (!addi.getType().isIndex())
+      return false;
+    int64_t lhs = 0;
+    int64_t rhs = 0;
+    if (!matchConstantIndex(addi.getLhs(), lhs) ||
+        !matchConstantIndex(addi.getRhs(), rhs))
+      return false;
+    out = lhs + rhs;
+    return true;
+  }
+
+  if (auto subi = v.getDefiningOp<arith::SubIOp>()) {
+    if (!subi.getType().isIndex())
+      return false;
+    int64_t lhs = 0;
+    int64_t rhs = 0;
+    if (!matchConstantIndex(subi.getLhs(), lhs) ||
+        !matchConstantIndex(subi.getRhs(), rhs))
+      return false;
+    out = lhs - rhs;
+    return true;
+  }
+
+  return false;
 }
 
 static bool matchIndex(Value idx, Value iv, int64_t &offset) {
@@ -127,6 +174,74 @@ static bool matchIndex(Value idx, Value iv, int64_t &offset) {
   }
 
   return false;
+}
+
+static Value stripMemrefCasts(Value v) {
+  while (auto cast = v.getDefiningOp<memref::CastOp>()) {
+    v = cast.getSource();
+  }
+  return v;
+}
+
+static memref::LoadOp getDirectLoad(Value v) {
+  return v.getDefiningOp<memref::LoadOp>();
+}
+
+static bool isTrivialCopy1(Value storeValue, Value inputMemref,
+                           const DenseMap<Value, OffsetKey1> &loadOffsets) {
+  auto load = getDirectLoad(storeValue);
+  if (!load)
+    return false;
+  if (stripMemrefCasts(load.getMemref()) != inputMemref)
+    return false;
+  auto it = loadOffsets.find(load.getResult());
+  if (it == loadOffsets.end())
+    return false;
+  return it->second.di == 0 && loadOffsets.size() == 1;
+}
+
+static bool isTrivialCopy2(Value storeValue, Value inputMemref,
+                           const DenseMap<Value, OffsetKey> &loadOffsets) {
+  auto load = getDirectLoad(storeValue);
+  if (!load)
+    return false;
+  if (stripMemrefCasts(load.getMemref()) != inputMemref)
+    return false;
+  auto it = loadOffsets.find(load.getResult());
+  if (it == loadOffsets.end())
+    return false;
+  return it->second.di == 0 && it->second.dj == 0 &&
+         loadOffsets.size() == 1;
+}
+
+static bool isTrivialCopy3(Value storeValue, Value inputMemref,
+                           const DenseMap<Value, OffsetKey3> &loadOffsets) {
+  auto load = getDirectLoad(storeValue);
+  if (!load)
+    return false;
+  if (stripMemrefCasts(load.getMemref()) != inputMemref)
+    return false;
+  auto it = loadOffsets.find(load.getResult());
+  if (it == loadOffsets.end())
+    return false;
+  return it->second.di == 0 && it->second.dj == 0 && it->second.dk == 0 &&
+         loadOffsets.size() == 1;
+}
+
+static bool matchLoadOffsets1(memref::LoadOp load, Value ivI,
+                              OffsetKey1 &out) {
+  if (load.getIndices().size() != 1)
+    return false;
+
+  int64_t di = 0;
+  if (!matchIndex(load.getIndices()[0], ivI, di))
+    return false;
+
+  if (std::abs(di) > 1)
+    return false;
+
+  out = OffsetKey1{di};
+  return true;
 }
 
 static bool matchLoadOffsets(memref::LoadOp load, Value ivI, Value ivJ,
@@ -189,6 +304,18 @@ struct StencilNestMatch {
   DenseMap<Value, OffsetKey> loadOffsets;
 };
 
+struct StencilNestMatch1 {
+  scf::ForOp loop;
+  memref::StoreOp store;
+  Value inputMemref;
+  Value outputMemref;
+  Value storeValue;
+  Type elemType;
+  int64_t lbI;
+  int64_t ubI;
+  DenseMap<Value, OffsetKey1> loadOffsets;
+};
+
 struct StencilNestMatch3 {
   scf::ForOp outer;
   scf::ForOp middle;
@@ -206,6 +333,62 @@ struct StencilNestMatch3 {
   int64_t ubI;
   DenseMap<Value, OffsetKey3> loadOffsets;
 };
+
+static LogicalResult collectExpr1(Value v, Type elemTy, Value ivI,
+                                  Value outputMemref, Value &inputMemref,
+                                  DenseMap<Value, OffsetKey1> &loadOffsets,
+                                  DenseSet<Value> &visited) {
+  if (visited.contains(v))
+    return success();
+  visited.insert(v);
+
+  Operation *def = v.getDefiningOp();
+  if (!def)
+    return failure();
+
+  if (auto load = dyn_cast<memref::LoadOp>(def)) {
+    auto memrefTy = dyn_cast<MemRefType>(load.getMemref().getType());
+    if (!memrefTy || memrefTy.getRank() != 1)
+      return failure();
+    if (memrefTy.getElementType() != elemTy)
+      return failure();
+    if (load.getMemref() == outputMemref)
+      return failure();
+
+    if (!inputMemref) {
+      inputMemref = load.getMemref();
+    } else if (inputMemref != load.getMemref()) {
+      return failure();
+    }
+
+    OffsetKey1 off;
+    if (!matchLoadOffsets1(load, ivI, off))
+      return failure();
+    loadOffsets[load.getResult()] = off;
+    return success();
+  }
+
+  if (auto cst = dyn_cast<arith::ConstantOp>(def)) {
+    auto attr = dyn_cast<IntegerAttr>(cst.getValue());
+    if (!attr || cst.getType() != elemTy)
+      return failure();
+    return success();
+  }
+
+  if (auto addi = dyn_cast<arith::AddIOp>(def)) {
+    if (addi.getType() != elemTy)
+      return failure();
+    if (failed(collectExpr1(addi.getLhs(), elemTy, ivI, outputMemref,
+                            inputMemref, loadOffsets, visited)))
+      return failure();
+    if (failed(collectExpr1(addi.getRhs(), elemTy, ivI, outputMemref,
+                            inputMemref, loadOffsets, visited)))
+      return failure();
+    return success();
+  }
+
+  return failure();
+}
 
 static LogicalResult collectExpr(Value v, Type elemTy, Value ivI, Value ivJ,
                                  Value outputMemref, Value &inputMemref,
@@ -400,6 +583,8 @@ static FailureOr<StencilNestMatch> matchStencilNest(scf::ForOp outer) {
     return failure();
   if (!inputMemref)
     return failure();
+  if (isTrivialCopy2(store.getValue(), inputMemref, loadOffsets))
+    return failure();
 
   return StencilNestMatch{outer,
                           inner,
@@ -413,6 +598,72 @@ static FailureOr<StencilNestMatch> matchStencilNest(scf::ForOp outer) {
                           lbJ,
                           ubJ,
                           std::move(loadOffsets)};
+}
+
+static FailureOr<StencilNestMatch1> matchStencilNest1(scf::ForOp loop) {
+  int64_t lbI = 0;
+  int64_t ubI = 0;
+  int64_t stepI = 0;
+  if (!matchConstantIndex(loop.getLowerBound(), lbI) ||
+      !matchConstantIndex(loop.getUpperBound(), ubI) ||
+      !matchConstantIndex(loop.getStep(), stepI) || stepI != 1)
+    return failure();
+  if (!loop.getInitArgs().empty())
+    return failure();
+
+  memref::StoreOp store;
+  Block &body = *loop.getBody();
+  for (Operation &op : body.getOperations()) {
+    if (auto s = dyn_cast<memref::StoreOp>(op)) {
+      if (store)
+        return failure();
+      store = s;
+      continue;
+    }
+    if (isa<memref::LoadOp, arith::AddIOp, arith::SubIOp, arith::ConstantOp,
+            scf::YieldOp>(op))
+      continue;
+    return failure();
+  }
+  if (!store)
+    return failure();
+
+  if (store.getIndices().size() != 1)
+    return failure();
+
+  int64_t offI = 0;
+  if (!matchIndex(store.getIndices()[0], loop.getInductionVar(), offI) ||
+      offI != 0)
+    return failure();
+
+  auto outMemrefTy = dyn_cast<MemRefType>(store.getMemref().getType());
+  if (!outMemrefTy || outMemrefTy.getRank() != 1)
+    return failure();
+  auto elemTy = outMemrefTy.getElementType();
+  if (!isa<IntegerType>(elemTy))
+    return failure();
+
+  DenseMap<Value, OffsetKey1> loadOffsets;
+  DenseSet<Value> visited;
+  Value inputMemref;
+  if (failed(collectExpr1(store.getValue(), elemTy, loop.getInductionVar(),
+                          store.getMemref(), inputMemref, loadOffsets,
+                          visited)))
+    return failure();
+  if (!inputMemref)
+    return failure();
+  if (isTrivialCopy1(store.getValue(), inputMemref, loadOffsets))
+    return failure();
+
+  return StencilNestMatch1{loop,
+                           store,
+                           inputMemref,
+                           store.getMemref(),
+                           store.getValue(),
+                           elemTy,
+                           lbI,
+                           ubI,
+                           std::move(loadOffsets)};
 }
 
 static FailureOr<StencilNestMatch3> matchStencilNest3(scf::ForOp outer) {
@@ -524,6 +775,8 @@ static FailureOr<StencilNestMatch3> matchStencilNest3(scf::ForOp outer) {
     return failure();
   if (!inputMemref)
     return failure();
+  if (isTrivialCopy3(store.getValue(), inputMemref, loadOffsets))
+    return failure();
 
   return StencilNestMatch3{outer,
                            middle,
@@ -585,6 +838,60 @@ static FailureOr<Value> buildExpr(
       return failure();
     auto rhs = buildExpr(addi.getRhs(), b, inputTemp, loadOffsets, accessValues,
                          cache);
+    if (failed(rhs))
+      return failure();
+    auto res = b.create<arith::AddIOp>(loc, *lhs, *rhs);
+    cache[v] = res.getResult();
+    return res.getResult();
+  }
+
+  return failure();
+}
+
+static FailureOr<Value> buildExpr1(
+    Value v, OpBuilder &b, Value inputTemp,
+    const DenseMap<Value, OffsetKey1> &loadOffsets,
+    DenseMap<OffsetKey1, Value> &accessValues,
+    DenseMap<Value, Value> &cache) {
+  if (auto it = cache.find(v); it != cache.end())
+    return it->second;
+
+  Operation *def = v.getDefiningOp();
+  if (!def)
+    return failure();
+
+  Location loc = def->getLoc();
+  if (auto load = dyn_cast<memref::LoadOp>(def)) {
+    auto it = loadOffsets.find(load.getResult());
+    if (it == loadOffsets.end())
+      return failure();
+    OffsetKey1 off = it->second;
+    auto accIt = accessValues.find(off);
+    if (accIt != accessValues.end()) {
+      cache[v] = accIt->second;
+      return accIt->second;
+    }
+
+    SmallVector<int64_t, 1> offsets{off.di};
+    auto acc = b.create<AccessOp>(loc, load.getType(), inputTemp, offsets);
+    accessValues[off] = acc.getResult();
+    cache[v] = acc.getResult();
+    return acc.getResult();
+  }
+
+  if (auto cst = dyn_cast<arith::ConstantOp>(def)) {
+    auto clone = b.create<arith::ConstantOp>(loc, cst.getValue());
+    cache[v] = clone.getResult();
+    return clone.getResult();
+  }
+
+  if (auto addi = dyn_cast<arith::AddIOp>(def)) {
+    auto lhs = buildExpr1(addi.getLhs(), b, inputTemp, loadOffsets,
+                          accessValues, cache);
+    if (failed(lhs))
+      return failure();
+    auto rhs = buildExpr1(addi.getRhs(), b, inputTemp, loadOffsets,
+                          accessValues, cache);
     if (failed(rhs))
       return failure();
     auto res = b.create<arith::AddIOp>(loc, *lhs, *rhs);
@@ -722,6 +1029,75 @@ static LogicalResult rewriteStencil(StencilNestMatch match) {
   return success();
 }
 
+static LogicalResult rewriteStencil1(StencilNestMatch1 match) {
+  auto inMemrefTy = dyn_cast<MemRefType>(match.inputMemref.getType());
+  auto outMemrefTy = dyn_cast<MemRefType>(match.outputMemref.getType());
+  if (!inMemrefTy || !outMemrefTy)
+    return failure();
+  if (!inMemrefTy.hasStaticShape() || !outMemrefTy.hasStaticShape())
+    return failure();
+  if (inMemrefTy.getRank() != 1 || outMemrefTy.getRank() != 1)
+    return failure();
+  if (inMemrefTy.getElementType() != outMemrefTy.getElementType())
+    return failure();
+  if (inMemrefTy.getShape() != outMemrefTy.getShape())
+    return failure();
+
+  SmallVector<int64_t, 1> fieldLb{0};
+  SmallVector<int64_t, 1> fieldUb{inMemrefTy.getDimSize(0)};
+  SmallVector<int64_t, 1> radius{1};
+
+  if (match.lbI < fieldLb[0] + radius[0] ||
+      match.ubI > fieldUb[0] - radius[0])
+    return failure();
+
+  MLIRContext *ctx = match.loop->getContext();
+  Location loc = match.loop->getLoc();
+  OpBuilder b(match.loop);
+
+  auto boundsAttr = BoundsAttr::get(
+      ctx, DenseI64ArrayAttr::get(ctx, {match.lbI}),
+      DenseI64ArrayAttr::get(ctx, {match.ubI}));
+  auto radiusAttr = DenseI64ArrayAttr::get(ctx, radius);
+  auto fieldBoundsAttr =
+      BoundsAttr::get(ctx, DenseI64ArrayAttr::get(ctx, fieldLb),
+                      DenseI64ArrayAttr::get(ctx, fieldUb));
+  auto locAttr = mlir::Neptune::NeptuneIR::LocationAttr::get(ctx, "cell");
+  auto layoutAttr = LayoutAttr::get(ctx, b.getStringAttr("zyx"),
+                                    DenseI64ArrayAttr(),
+                                    DenseI64ArrayAttr(),
+                                    DenseI64ArrayAttr());
+
+  auto fieldTy =
+      FieldType::get(ctx, match.elemType, fieldBoundsAttr, locAttr, layoutAttr);
+  auto tempTy = TempType::get(ctx, match.elemType, fieldBoundsAttr, locAttr);
+
+  auto inField = b.create<WrapOp>(loc, fieldTy, match.inputMemref);
+  auto outField = b.create<WrapOp>(loc, fieldTy, match.outputMemref);
+  auto inTemp = b.create<LoadOp>(loc, tempTy, inField);
+  auto apply = b.create<ApplyOp>(loc, tempTy, ValueRange{inTemp}, boundsAttr,
+                                 StencilShapeAttr(), radiusAttr);
+
+  Block *body = new Block();
+  apply.getBody().push_back(body);
+  body->addArgument(inTemp.getType(), loc);
+  Value regionTemp = body->getArgument(0);
+
+  OpBuilder bodyBuilder = OpBuilder::atBlockBegin(body);
+  DenseMap<OffsetKey1, Value> accessValues;
+  DenseMap<Value, Value> cache;
+  auto newVal = buildExpr1(match.storeValue, bodyBuilder, regionTemp,
+                           match.loadOffsets, accessValues, cache);
+  if (failed(newVal))
+    return failure();
+  bodyBuilder.create<YieldOp>(loc, *newVal);
+
+  b.create<StoreOp>(loc, apply.getResult(), outField, BoundsAttr());
+
+  match.loop.erase();
+  return success();
+}
+
 static LogicalResult rewriteStencil3(StencilNestMatch3 match) {
   auto inMemrefTy = dyn_cast<MemRefType>(match.inputMemref.getType());
   auto outMemrefTy = dyn_cast<MemRefType>(match.outputMemref.getType());
@@ -820,8 +1196,13 @@ struct SCFToNeptuneIRPass final
         continue;
       }
       auto match2 = matchStencilNest(outer);
-      if (succeeded(match2))
+      if (succeeded(match2)) {
         (void)rewriteStencil(*match2);
+        continue;
+      }
+      auto match1 = matchStencilNest1(outer);
+      if (succeeded(match1))
+        (void)rewriteStencil1(*match1);
     }
   }
 };

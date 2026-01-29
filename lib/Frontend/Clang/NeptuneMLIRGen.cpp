@@ -299,6 +299,9 @@ private:
     if (auto *FS = llvm::dyn_cast<clang::ForStmt>(stmt)) {
       return lowerFor(FS);
     }
+    if (auto *IS = llvm::dyn_cast<clang::IfStmt>(stmt)) {
+      return lowerIf(IS);
+    }
     if (auto *BO = llvm::dyn_cast<clang::BinaryOperator>(stmt)) {
       if (BO->isAssignmentOp() || BO->isCompoundAssignmentOp()) {
         return lowerAssign(BO);
@@ -375,6 +378,48 @@ private:
     return mlir::success();
   }
 
+  mlir::LogicalResult lowerIf(clang::IfStmt *IS) {
+    mlir::Value cond = lowerCondExpr(IS->getCond());
+    if (!cond) {
+      return mlir::failure();
+    }
+
+    bool hasElse = IS->getElse() != nullptr;
+    mlir::Location loc = builder.getUnknownLoc();
+    auto ifOp = builder.create<mlir::scf::IfOp>(loc, cond, hasElse);
+
+    mlir::Block &thenBlock = ifOp.getThenRegion().front();
+    builder.setInsertionPointToStart(&thenBlock);
+    pushScope();
+    if (failed(lowerStmt(IS->getThen()))) {
+      popScope();
+      return mlir::failure();
+    }
+    popScope();
+    if (!thenBlock.getTerminator()) {
+      builder.setInsertionPointToEnd(&thenBlock);
+      builder.create<mlir::scf::YieldOp>(loc);
+    }
+
+    if (hasElse) {
+      mlir::Block &elseBlock = ifOp.getElseRegion().front();
+      builder.setInsertionPointToStart(&elseBlock);
+      pushScope();
+      if (failed(lowerStmt(IS->getElse()))) {
+        popScope();
+        return mlir::failure();
+      }
+      popScope();
+      if (!elseBlock.getTerminator()) {
+        builder.setInsertionPointToEnd(&elseBlock);
+        builder.create<mlir::scf::YieldOp>(loc);
+      }
+    }
+
+    builder.setInsertionPointAfter(ifOp);
+    return mlir::success();
+  }
+
   mlir::LogicalResult lowerFor(clang::ForStmt *FS) {
     auto *init = FS->getInit();
     auto *cond = FS->getCond();
@@ -438,6 +483,79 @@ private:
       builder.create<mlir::scf::YieldOp>(loc);
     }
     return mlir::success();
+  }
+
+  mlir::Value lowerCondExpr(clang::Expr *expr) {
+    if (!expr) {
+      return nullptr;
+    }
+    expr = expr->IgnoreParenImpCasts();
+    mlir::Location loc = builder.getUnknownLoc();
+
+    if (auto *lit = llvm::dyn_cast<clang::IntegerLiteral>(expr)) {
+      auto one = builder.create<mlir::arith::ConstantIntOp>(
+          loc, lit->getValue().getSExtValue() != 0, 1);
+      return one.getResult();
+    }
+
+    if (auto *UO = llvm::dyn_cast<clang::UnaryOperator>(expr)) {
+      if (UO->getOpcode() == clang::UO_LNot) {
+        mlir::Value val = lowerCondExpr(UO->getSubExpr());
+        if (!val) {
+          return nullptr;
+        }
+        auto one = builder.create<mlir::arith::ConstantIntOp>(loc, 1, 1);
+        return builder.create<mlir::arith::XOrIOp>(loc, val, one);
+      }
+    }
+
+    if (auto *BO = llvm::dyn_cast<clang::BinaryOperator>(expr)) {
+      auto opcode = BO->getOpcode();
+      if (opcode == clang::BO_LAnd || opcode == clang::BO_LOr) {
+        mlir::Value lhs = lowerCondExpr(BO->getLHS());
+        mlir::Value rhs = lowerCondExpr(BO->getRHS());
+        if (!lhs || !rhs) {
+          return nullptr;
+        }
+        if (opcode == clang::BO_LAnd) {
+          return builder.create<mlir::arith::AndIOp>(loc, lhs, rhs);
+        }
+        return builder.create<mlir::arith::OrIOp>(loc, lhs, rhs);
+      }
+
+      mlir::Value lhs = lowerIndexExpr(BO->getLHS());
+      mlir::Value rhs = lowerIndexExpr(BO->getRHS());
+      if (!lhs || !rhs) {
+        return nullptr;
+      }
+      mlir::arith::CmpIPredicate pred;
+      switch (opcode) {
+      case clang::BO_EQ:
+        pred = mlir::arith::CmpIPredicate::eq;
+        break;
+      case clang::BO_NE:
+        pred = mlir::arith::CmpIPredicate::ne;
+        break;
+      case clang::BO_LT:
+        pred = mlir::arith::CmpIPredicate::slt;
+        break;
+      case clang::BO_LE:
+        pred = mlir::arith::CmpIPredicate::sle;
+        break;
+      case clang::BO_GT:
+        pred = mlir::arith::CmpIPredicate::sgt;
+        break;
+      case clang::BO_GE:
+        pred = mlir::arith::CmpIPredicate::sge;
+        break;
+      default:
+        return nullptr;
+      }
+      return builder.create<mlir::arith::CmpIOp>(loc, pred, lhs, rhs);
+    }
+
+    (void)emitUnsupported(expr->getBeginLoc(), expr->getStmtClassName());
+    return nullptr;
   }
 
   mlir::LogicalResult lowerAssign(clang::BinaryOperator *BO) {

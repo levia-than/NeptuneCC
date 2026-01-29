@@ -62,4 +62,15 @@ def SCFToNeptuneIRPass : Pass<"neptuneir-scf-to-neptuneir", "mlir::func::FuncOp"
   ];
 }
 
+def SCFBoundarySimplifyPass
+    : Pass<"neptuneir-scf-boundary-simplify", "mlir::func::FuncOp"> {
+  let summary = "peel boundary guards and unswitch loop-invariant ifs in SCF";
+  let dependentDialects = [
+    "mlir::func::FuncDialect",
+    "mlir::scf::SCFDialect",
+    "mlir::arith::ArithDialect",
+    "mlir::memref::MemRefDialect"
+  ];
+}
+
 #endif // NEPTUNEIR_PASSES_TD

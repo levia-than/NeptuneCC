@@ -1322,7 +1322,7 @@ static void emitSlabCopy2D(CodeWriter &w, const std::string &inName,
     w.dedent();
     w.line("}");
   }
-  if (j1 < w && i1 > i0) {
+  if (j1 < width && i1 > i0) {
     w.line(llvm::formatv("for (int64_t i = {0}; i < {1}; ++i) {{", i0, i1)
                .str());
     w.indent();
@@ -1493,9 +1493,11 @@ static void emitDimsTemplateAndInit(CodeWriter &w, llvm::StringRef kernelTag,
   for (size_t i = 0; i < dims.size(); ++i) {
     const DimSpec &d = dims[i];
     llvm::StringRef comma = (i + 1 < dims.size()) ? "," : "";
-    w.line(llvm::formatv("{{{0}, {1}, {2}, 0}}{3}", d.min, d.extent, d.stride,
-                         comma)
-               .str());
+    std::string line;
+    llvm::raw_string_ostream lineStream(line);
+    lineStream << "{" << d.min << ", " << d.extent << ", " << d.stride
+               << ", 0}" << comma;
+    w.line(lineStream.str());
   }
   w.dedent();
   w.line("};");
