@@ -1,3 +1,6 @@
+// RUN: neptune-opt %s -neptuneir-emitc-halide -o %t.mlir
+// RUN: FileCheck %s --input-file=%t.mlir --check-prefix=MLIR
+
 module {
   func.func @smoke_apply_laplace3d(
       %in  : memref<16x16x16xf64>,
@@ -125,3 +128,7 @@ module {
     return
   }
 }
+
+// MLIR-LABEL: func @neptuneir_build_halide_kernels
+// MLIR: call_opaque "neptune_halide::compile"
+// MLIR-NOT: emitc.verbatim

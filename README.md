@@ -57,15 +57,15 @@ The build script symlinks `compile_commands.json` to the repo root and runs
 - Passes: `neptuneir-verify-forms`, `neptuneir-normalize-apply`,
   `neptuneir-split-domain`, `neptuneir-emitc-halide`.
 
-Note: some legacy smoke inputs still use the `neptune_ir` namespace, while the
-newer syntax uses the `neptune` dialect (see `test/smoke_tests/smoke_emitC_for_apply.mlir`).
+Note: some legacy inputs still use the `neptune_ir` namespace, while the
+newer syntax uses the `neptune` dialect (see `test/mlir_tests/smoke_emitC_for_apply.mlir`).
 
 ## Basic usage
 ```bash
-./build/project-build/bin/neptune-opt test/smoke_tests/smoke_emitC_for_apply.mlir \
+./build/project-build/bin/neptune-opt test/mlir_tests/smoke_emitC_for_apply.mlir \
   --neptuneir-verify-forms --neptuneir-normalize-apply -o normalized.mlir
 
-./build/project-build/bin/neptune-opt test/smoke_tests/smoke_emitC_for_apply.mlir \
+./build/project-build/bin/neptune-opt test/mlir_tests/smoke_emitC_for_apply.mlir \
   --neptuneir-emitc-halide -o emitc.mlir
 ```
 
@@ -74,12 +74,12 @@ lowering experiments.
 
 For the Clang frontend:
 ```bash
-./build/project-build/bin/neptune-cc test/smoke_tests/pragma_kernel_block.cpp \
+./build/project-build/bin/neptune-cc test/case_test/case1/case1.cpp \
   --out-dir /tmp/neptune_out
 
 # If compile_commands.json is not in the repo root:
 ./build/project-build/bin/neptune-cc -p build/project-build \
-  test/smoke_tests/pragma_kernel_block.cpp --out-dir /tmp/neptune_out
+  test/case_test/case1/case1.cpp --out-dir /tmp/neptune_out
 ```
 
 `neptune-cc` writes a `manifest.json` under the chosen output directory.
