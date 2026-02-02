@@ -393,7 +393,7 @@ static bool inferScheduleForApply(func::FuncOp func, ApplyOp apply) {
   }
 
   NamedAttrList scheduleAttrs;
-  scheduleAttrs.set("tile", DenseI64ArrayAttr::get(ctx, tile));
+  scheduleAttrs.set("split", DenseI64ArrayAttr::get(ctx, tile));
   scheduleAttrs.set("vec", IntegerAttr::get(IntegerType::get(ctx, 64), vec));
   scheduleAttrs.set("par_dim", StringAttr::get(ctx, parDim));
   scheduleAttrs.set("unroll",
@@ -417,7 +417,7 @@ static bool inferScheduleForApply(func::FuncOp func, ApplyOp apply) {
   llvm::outs() << " radius=";
   printArray(llvm::outs(), radius);
   llvm::outs() << " elem_bytes=" << elemBytes;
-  llvm::outs() << " tile=";
+  llvm::outs() << " split=";
   printArray(llvm::outs(), tile);
   llvm::outs() << " vec=" << vec << " par=" << parDim
                << " unroll=" << unroll;

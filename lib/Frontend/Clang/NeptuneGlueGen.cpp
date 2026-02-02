@@ -63,6 +63,16 @@ struct KernelInfo {
   llvm::SmallVector<int64_t, 4> radius;
   std::string radiusSource;
   std::string boundsSource;
+  bool overlapSupported = false;
+  std::string overlapReason;
+  llvm::SmallVector<int64_t, 4> overlapInteriorLb;
+  llvm::SmallVector<int64_t, 4> overlapInteriorUb;
+  struct RegionInfo {
+    std::string suffix;
+    llvm::SmallVector<int64_t, 4> lb;
+    llvm::SmallVector<int64_t, 4> ub;
+  };
+  llvm::SmallVector<RegionInfo, 8> overlapFaces;
 };
 
 struct Replacement {
@@ -118,6 +128,127 @@ static void logResidualDecision(const KernelInfo &info,
                                 llvm::raw_ostream &os);
 static void logKernelSummary(const KernelInfo &info, const PortInfo &shapePort,
                              llvm::raw_ostream &os);
+static void logOverlapInfo(const KernelInfo &info, llvm::raw_ostream &os);
+
+static bool computeOverlapRegions(KernelInfo &info) {
+  size_t rank = info.outMin.size();
+  if (rank == 0 || rank != info.outExtent.size() ||
+      rank != info.radius.size()) {
+    info.overlapReason = "missing bounds/radius";
+    return false;
+  }
+  if (rank > 3) {
+    info.overlapReason = "rank>3 overlap not supported yet";
+    return false;
+  }
+
+  llvm::SmallVector<int64_t, 4> lb;
+  llvm::SmallVector<int64_t, 4> ub;
+  lb.reserve(rank);
+  ub.reserve(rank);
+  for (size_t i = 0; i < rank; ++i) {
+    lb.push_back(info.outMin[i]);
+    ub.push_back(info.outMin[i] + info.outExtent[i]);
+  }
+
+  llvm::SmallVector<int64_t, 4> safeLb;
+  llvm::SmallVector<int64_t, 4> safeUb;
+  safeLb.reserve(rank);
+  safeUb.reserve(rank);
+  for (size_t i = 0; i < rank; ++i) {
+    safeLb.push_back(lb[i] + info.radius[i]);
+    safeUb.push_back(ub[i] - info.radius[i]);
+  }
+  for (size_t i = 0; i < rank; ++i) {
+    if (safeUb[i] <= safeLb[i]) {
+      info.overlapReason = "safe interior empty";
+      return false;
+    }
+  }
+
+  info.overlapInteriorLb = safeLb;
+  info.overlapInteriorUb = safeUb;
+
+  info.overlapFaces.clear();
+  if (rank == 1) {
+    KernelInfo::RegionInfo lo;
+    lo.suffix = "face_lo";
+    lo.lb = {lb[0]};
+    lo.ub = {lb[0] + info.radius[0]};
+    KernelInfo::RegionInfo hi;
+    hi.suffix = "face_hi";
+    hi.lb = {ub[0] - info.radius[0]};
+    hi.ub = {ub[0]};
+    info.overlapFaces.push_back(lo);
+    info.overlapFaces.push_back(hi);
+  } else if (rank == 2) {
+    const int64_t i0 = lb[0], i1 = ub[0];
+    const int64_t j0 = lb[1], j1 = ub[1];
+    const int64_t ri = info.radius[0];
+    const int64_t rj = info.radius[1];
+    KernelInfo::RegionInfo top;
+    top.suffix = "face_top";
+    top.lb = {i0, j0};
+    top.ub = {i0 + ri, j1};
+    KernelInfo::RegionInfo bottom;
+    bottom.suffix = "face_bottom";
+    bottom.lb = {i1 - ri, j0};
+    bottom.ub = {i1, j1};
+    KernelInfo::RegionInfo left;
+    left.suffix = "face_left";
+    left.lb = {i0 + ri, j0};
+    left.ub = {i1 - ri, j0 + rj};
+    KernelInfo::RegionInfo right;
+    right.suffix = "face_right";
+    right.lb = {i0 + ri, j1 - rj};
+    right.ub = {i1 - ri, j1};
+    info.overlapFaces.push_back(top);
+    info.overlapFaces.push_back(bottom);
+    info.overlapFaces.push_back(left);
+    info.overlapFaces.push_back(right);
+  } else if (rank == 3) {
+    const int64_t i0 = lb[0], i1 = ub[0];
+    const int64_t j0 = lb[1], j1 = ub[1];
+    const int64_t k0 = lb[2], k1 = ub[2];
+    const int64_t ri = info.radius[0];
+    const int64_t rj = info.radius[1];
+    const int64_t rk = info.radius[2];
+
+    KernelInfo::RegionInfo zlo;
+    zlo.suffix = "face_zlo";
+    zlo.lb = {i0, j0, k0};
+    zlo.ub = {i1, j1, k0 + rk};
+    KernelInfo::RegionInfo zhi;
+    zhi.suffix = "face_zhi";
+    zhi.lb = {i0, j0, k1 - rk};
+    zhi.ub = {i1, j1, k1};
+    KernelInfo::RegionInfo ylo;
+    ylo.suffix = "face_ylo";
+    ylo.lb = {i0, j0, k0 + rk};
+    ylo.ub = {i1, j0 + rj, k1 - rk};
+    KernelInfo::RegionInfo yhi;
+    yhi.suffix = "face_yhi";
+    yhi.lb = {i0, j1 - rj, k0 + rk};
+    yhi.ub = {i1, j1, k1 - rk};
+    KernelInfo::RegionInfo xlo;
+    xlo.suffix = "face_xlo";
+    xlo.lb = {i0, j0 + rj, k0 + rk};
+    xlo.ub = {i0 + ri, j1 - rj, k1 - rk};
+    KernelInfo::RegionInfo xhi;
+    xhi.suffix = "face_xhi";
+    xhi.lb = {i1 - ri, j0 + rj, k0 + rk};
+    xhi.ub = {i1, j1 - rj, k1 - rk};
+    info.overlapFaces.push_back(zlo);
+    info.overlapFaces.push_back(zhi);
+    info.overlapFaces.push_back(ylo);
+    info.overlapFaces.push_back(yhi);
+    info.overlapFaces.push_back(xlo);
+    info.overlapFaces.push_back(xhi);
+  }
+
+  info.overlapSupported = true;
+  return true;
+}
 static std::string parseBoundaryCopyMode();
 
 static bool matchConstantIndex(mlir::Value v, int64_t &out) {
@@ -971,6 +1102,8 @@ static bool collectKernelInfos(const EventDB &db,
                                : info.residualReason)
                        << "\n";
         }
+      } else {
+        computeOverlapRegions(info);
       }
     }
 
@@ -1041,10 +1174,10 @@ static std::string detectNewline(llvm::StringRef content) {
   return "\n";
 }
 
-static void ensureKernelInclude(std::string &content) {
+static void ensureIncludeLine(std::string &content,
+                              llvm::StringRef includeLine) {
   llvm::StringRef contentRef(content);
-  if (contentRef.find("#include \"neptunecc_kernels.h\"") !=
-      llvm::StringRef::npos) {
+  if (contentRef.find(includeLine) != llvm::StringRef::npos) {
     return;
   }
 
@@ -1103,9 +1236,22 @@ static void ensureKernelInclude(std::string &content) {
     break;
   }
 
-  std::string includeLine =
-      std::string("#include \"neptunecc_kernels.h\"") + newline;
-  content.insert(insertPos, includeLine);
+  std::string includeText = includeLine.str();
+  includeText += newline;
+  content.insert(insertPos, includeText);
+}
+
+static void ensureKernelInclude(std::string &content) {
+  ensureIncludeLine(content, "#include \"neptunecc_kernels.h\"");
+}
+
+static llvm::StringRef getClauseValue(const Event &event,
+                                      llvm::StringRef key) {
+  for (const auto &clause : event.clauses) {
+    if (clause.key == key)
+      return clause.val;
+  }
+  return {};
 }
 
 static void logResidualDecision(const KernelInfo &info,
@@ -1172,9 +1318,30 @@ static void logKernelSummary(const KernelInfo &info, const PortInfo &shapePort,
   }
 }
 
-static void emitKernelSignature(llvm::raw_ostream &os,
-                                const KernelInfo &kernel) {
-  os << "int " << kernel.tag << "(";
+static void logOverlapInfo(const KernelInfo &info, llvm::raw_ostream &os) {
+  if (!info.overlapSupported) {
+    os << "neptune-cc:   overlap=skip reason=" << info.overlapReason << "\n";
+    return;
+  }
+  os << "neptune-cc:   overlap=enabled interior=[";
+  printI64Array(os, info.overlapInteriorLb);
+  os << " .. ";
+  printI64Array(os, info.overlapInteriorUb);
+  os << ")\n";
+  os << "neptune-cc:   overlap_faces=" << info.overlapFaces.size() << "\n";
+  for (const auto &face : info.overlapFaces) {
+    os << "neptune-cc:     " << face.suffix << " [";
+    printI64Array(os, face.lb);
+    os << " .. ";
+    printI64Array(os, face.ub);
+    os << ")\n";
+  }
+}
+
+static void emitKernelSignatureWithName(llvm::raw_ostream &os,
+                                        llvm::StringRef name,
+                                        const KernelInfo &kernel) {
+  os << "int " << name << "(";
   for (size_t i = 0; i < kernel.ports.size(); ++i) {
     if (i > 0) {
       os << ", ";
@@ -1182,6 +1349,11 @@ static void emitKernelSignature(llvm::raw_ostream &os,
     os << "int32_t* " << kernel.ports[i].name;
   }
   os << ")";
+}
+
+static void emitKernelSignature(llvm::raw_ostream &os,
+                                const KernelInfo &kernel) {
+  emitKernelSignatureWithName(os, kernel.tag, kernel);
 }
 
 static bool writeGlueHeader(llvm::StringRef glueDir,
@@ -1217,6 +1389,24 @@ static bool writeGlueHeader(llvm::StringRef glueDir,
     emitKernelSignature(sigStream, kernel);
     sigStream << ";";
     w.line(sigStream.str());
+
+    if (kernel.overlapSupported) {
+      std::string interiorName = kernel.tag + "_interior";
+      std::string interiorSig;
+      llvm::raw_string_ostream interiorStream(interiorSig);
+      emitKernelSignatureWithName(interiorStream, interiorName, kernel);
+      interiorStream << ";";
+      w.line(interiorStream.str());
+
+      for (const auto &face : kernel.overlapFaces) {
+        std::string faceName = kernel.tag + "_" + face.suffix;
+        std::string faceSig;
+        llvm::raw_string_ostream faceStream(faceSig);
+        emitKernelSignatureWithName(faceStream, faceName, kernel);
+        faceStream << ";";
+        w.line(faceStream.str());
+      }
+    }
   }
   w.dedent();
   w.line("} // namespace neptunecc");
@@ -1476,15 +1666,12 @@ struct DimSpec {
   int64_t stride = 0;
 };
 
-static void emitDimsTemplateAndInit(CodeWriter &w, llvm::StringRef kernelTag,
-                                    llvm::StringRef prefix, unsigned roleIndex,
+static void emitDimsTemplateAndInit(CodeWriter &w, llvm::StringRef base,
                                     unsigned rank,
                                     llvm::ArrayRef<DimSpec> dims,
                                     int64_t offsetElems) {
-  std::string base =
-      llvm::formatv("{0}_{1}{2}", kernelTag, prefix, roleIndex).str();
-  std::string dimsName = base + "_dims";
-  std::string templName = base + "_templ";
+  std::string dimsName = std::string(base) + "_dims";
+  std::string templName = std::string(base) + "_templ";
 
   w.line(llvm::formatv("static const halide_dimension_t {0}[{1}] = {{",
                        dimsName, rank)
@@ -1526,6 +1713,109 @@ static void emitDimsTemplateAndInit(CodeWriter &w, llvm::StringRef kernelTag,
   w.dedent();
   w.line("}");
   w.line();
+}
+
+static void emitDimsTemplateAndInit(CodeWriter &w, llvm::StringRef kernelTag,
+                                    llvm::StringRef prefix, unsigned roleIndex,
+                                    unsigned rank,
+                                    llvm::ArrayRef<DimSpec> dims,
+                                    int64_t offsetElems) {
+  std::string base =
+      llvm::formatv("{0}_{1}{2}", kernelTag, prefix, roleIndex).str();
+  emitDimsTemplateAndInit(w, base, rank, dims, offsetElems);
+}
+
+static std::string buildBaseName(const KernelInfo &kernel,
+                                 const PortInfo &port,
+                                 llvm::StringRef suffix) {
+  std::string base = llvm::formatv("{0}_{1}{2}", kernel.tag,
+                                   port.isInput ? "in" : "out",
+                                   port.roleIndex)
+                         .str();
+  if (!suffix.empty()) {
+    base += "_";
+    base += suffix.str();
+  }
+  return base;
+}
+
+static std::string buildInitName(const KernelInfo &kernel,
+                                 const PortInfo &port,
+                                 llvm::StringRef suffix) {
+  return "init_" + buildBaseName(kernel, port, suffix);
+}
+
+static void emitPortTemplatesForRegion(CodeWriter &w, const KernelInfo &kernel,
+                                       const PortInfo &port,
+                                       llvm::ArrayRef<int64_t> regionOutMin,
+                                       llvm::ArrayRef<int64_t> regionOutExtent,
+                                       bool allowGhostedPolicy,
+                                       llvm::StringRef suffix,
+                                       bool logPolicy) {
+  const char *prefix = port.isInput ? "in" : "out";
+  size_t rank = port.rank;
+  llvm::SmallVector<int64_t, 4> strides(rank, 1);
+  for (size_t i = rank; i-- > 1;) {
+    strides[i - 1] = strides[i] * port.shape[i];
+  }
+
+  llvm::SmallVector<int64_t, 4> mins(rank, 0);
+  llvm::SmallVector<int64_t, 4> extents(rank, 0);
+  int64_t offsetElems = 0;
+
+  if (port.isInput) {
+    bool useGhosted = port.isGhosted && allowGhostedPolicy;
+    const char *policy = useGhosted ? "P1" : "P0";
+    for (size_t d = 0; d < rank; ++d) {
+      if (useGhosted) {
+        mins[d] = -kernel.radius[d];
+      } else {
+        mins[d] = -regionOutMin[d];
+      }
+      extents[d] = port.shape[d];
+    }
+    if (useGhosted) {
+      for (size_t d = 0; d < rank; ++d) {
+        offsetElems += (regionOutMin[d] - kernel.radius[d]) * strides[d];
+      }
+    }
+    if (logPolicy) {
+      llvm::outs() << "neptune-cc:   " << prefix << port.roleIndex
+                   << " policy=" << policy;
+      if (port.isGhosted) {
+        if (useGhosted) {
+          llvm::outs() << "(ghosted)";
+        } else {
+          llvm::outs() << "(ghosted->P0)";
+        }
+      }
+      llvm::outs() << " mins=";
+      printI64Array(llvm::outs(), mins);
+      llvm::outs() << " host_offset_elems=" << offsetElems << "\n";
+    }
+  } else {
+    for (size_t d = 0; d < rank; ++d) {
+      mins[d] = 0;
+      extents[d] = regionOutExtent[d];
+      offsetElems += regionOutMin[d] * strides[d];
+    }
+    if (logPolicy) {
+      llvm::outs() << "neptune-cc:   " << prefix << port.roleIndex
+                   << " mins=";
+      printI64Array(llvm::outs(), mins);
+      llvm::outs() << " host_offset_elems=" << offsetElems << "\n";
+    }
+  }
+
+  llvm::SmallVector<DimSpec, 4> dims;
+  dims.reserve(rank);
+  for (size_t i = 0; i < rank; ++i) {
+    size_t d = rank - 1 - i;
+    dims.push_back(DimSpec{mins[d], extents[d], strides[d]});
+  }
+
+  std::string base = buildBaseName(kernel, port, suffix);
+  emitDimsTemplateAndInit(w, base, rank, dims, offsetElems);
 }
 
 static bool writeGlueCpp(llvm::StringRef glueDir,
@@ -1598,69 +1888,44 @@ static bool writeGlueCpp(llvm::StringRef glueDir,
     }
     logKernelSummary(kernel, *inPort, llvm::outs());
     logResidualDecision(kernel, llvm::outs());
+    logOverlapInfo(kernel, llvm::outs());
 
     for (const auto &port : kernel.ports) {
       if (!isHalideArg(kernel, port.argIndex)) {
         continue;
       }
-      const char *prefix = port.isInput ? "in" : "out";
-      llvm::SmallVector<int64_t, 4> strides(rank, 1);
-      for (size_t i = rank; i-- > 1;) {
-        strides[i - 1] = strides[i] * port.shape[i];
-      }
+      emitPortTemplatesForRegion(w, kernel, port, kernel.outMin,
+                                 kernel.outExtent, allowGhostedPolicy, "",
+                                 true);
+    }
 
-      llvm::SmallVector<int64_t, 4> mins(rank, 0);
-      llvm::SmallVector<int64_t, 4> extents(rank, 0);
-      int64_t offsetElems = 0;
-      if (port.isInput) {
-        bool useGhosted = port.isGhosted && allowGhostedPolicy;
-        const char *policy = useGhosted ? "P1" : "P0";
-        for (size_t d = 0; d < rank; ++d) {
-          if (useGhosted) {
-            mins[d] = -kernel.radius[d];
-          } else {
-            mins[d] = -kernel.outMin[d];
-          }
-          extents[d] = port.shape[d];
-        }
-        if (useGhosted) {
-          for (size_t d = 0; d < rank; ++d) {
-            offsetElems += (kernel.outMin[d] - kernel.radius[d]) * strides[d];
-          }
-        }
-        llvm::outs() << "neptune-cc:   " << prefix << port.roleIndex
-                     << " policy=" << policy;
-        if (port.isGhosted) {
-          if (useGhosted) {
-            llvm::outs() << "(ghosted)";
-          } else {
-            llvm::outs() << "(ghosted->P0)";
-          }
-        }
-        llvm::outs() << " mins=";
-        printI64Array(llvm::outs(), mins);
-        llvm::outs() << " host_offset_elems=" << offsetElems << "\n";
-      } else {
-        for (size_t d = 0; d < rank; ++d) {
-          mins[d] = 0;
-          extents[d] = kernel.outExtent[d];
-          offsetElems += kernel.outMin[d] * strides[d];
-        }
-        llvm::outs() << "neptune-cc:   " << prefix << port.roleIndex
-                     << " mins=";
-        printI64Array(llvm::outs(), mins);
-        llvm::outs() << " host_offset_elems=" << offsetElems << "\n";
+    if (kernel.overlapSupported) {
+      llvm::SmallVector<int64_t, 4> interiorExtent(rank, 0);
+      for (size_t d = 0; d < rank; ++d) {
+        interiorExtent[d] =
+            kernel.overlapInteriorUb[d] - kernel.overlapInteriorLb[d];
       }
-
-      llvm::SmallVector<DimSpec, 4> dims;
-      dims.reserve(rank);
-      for (size_t i = 0; i < rank; ++i) {
-        size_t d = rank - 1 - i;
-        dims.push_back(
-            DimSpec{mins[d], extents[d], strides[d]});
+      for (const auto &port : kernel.ports) {
+        if (!isHalideArg(kernel, port.argIndex)) {
+          continue;
+        }
+        emitPortTemplatesForRegion(w, kernel, port, kernel.overlapInteriorLb,
+                                   interiorExtent, allowGhostedPolicy,
+                                   "interior", false);
       }
-      emitDimsTemplateAndInit(w, kernel.tag, prefix, port.roleIndex, rank, dims,
-                              offsetElems);
+      for (const auto &face : kernel.overlapFaces) {
+        llvm::SmallVector<int64_t, 4> faceExtent(rank, 0);
+        for (size_t d = 0; d < rank; ++d) {
+          faceExtent[d] = face.ub[d] - face.lb[d];
+        }
+        for (const auto &port : kernel.ports) {
+          if (!isHalideArg(kernel, port.argIndex)) {
+            continue;
+          }
+          emitPortTemplatesForRegion(w, kernel, port, face.lb, faceExtent,
+                                     allowGhostedPolicy, face.suffix, false);
+        }
+      }
     }
 
     std::string signature;
@@ -1678,7 +1943,8 @@ static bool writeGlueCpp(llvm::StringRef glueDir,
       w.line(llvm::formatv("halide_buffer_t {0}{1}_buf;", prefix,
                            port->roleIndex)
                  .str());
-      w.line(llvm::formatv("init_{0}_{1}{2}({1}{2}_buf, {3});", kernel.tag,
+      w.line(llvm::formatv("{0}({1}{2}_buf, {3});",
+                           buildInitName(kernel, *port, ""),
                            prefix, port->roleIndex, port->name)
                  .str());
     }
@@ -1728,6 +1994,60 @@ static bool writeGlueCpp(llvm::StringRef glueDir,
     w.dedent();
     w.line("}");
     w.line();
+
+    if (kernel.overlapSupported) {
+      std::string interiorName = kernel.tag + "_interior";
+      std::string interiorSig;
+      llvm::raw_string_ostream interiorSigStream(interiorSig);
+      emitKernelSignatureWithName(interiorSigStream, interiorName, kernel);
+      interiorSigStream << " {";
+      w.line(interiorSigStream.str());
+      w.indent();
+      for (unsigned arg : kernel.halideArgs) {
+        const PortInfo *port = findPortByArgIndex(kernel, arg);
+        if (!port)
+          continue;
+        const char *prefix = port->isInput ? "in" : "out";
+        w.line(llvm::formatv("halide_buffer_t {0}{1}_buf;", prefix,
+                             port->roleIndex)
+                   .str());
+        w.line(llvm::formatv("{0}({1}{2}_buf, {3});",
+                             buildInitName(kernel, *port, "interior"),
+                             prefix, port->roleIndex, port->name)
+                   .str());
+      }
+      w.line(callStream.str());
+      w.dedent();
+      w.line("}");
+      w.line();
+
+      for (const auto &face : kernel.overlapFaces) {
+        std::string faceName = kernel.tag + "_" + face.suffix;
+        std::string faceSig;
+        llvm::raw_string_ostream faceSigStream(faceSig);
+        emitKernelSignatureWithName(faceSigStream, faceName, kernel);
+        faceSigStream << " {";
+        w.line(faceSigStream.str());
+        w.indent();
+        for (unsigned arg : kernel.halideArgs) {
+          const PortInfo *port = findPortByArgIndex(kernel, arg);
+          if (!port)
+            continue;
+          const char *prefix = port->isInput ? "in" : "out";
+          w.line(llvm::formatv("halide_buffer_t {0}{1}_buf;", prefix,
+                               port->roleIndex)
+                     .str());
+          w.line(llvm::formatv("{0}({1}{2}_buf, {3});",
+                               buildInitName(kernel, *port, face.suffix),
+                               prefix, port->roleIndex, port->name)
+                     .str());
+        }
+        w.line(callStream.str());
+        w.dedent();
+        w.line("}");
+        w.line();
+      }
+    }
   }
 
   w.line("} // namespace neptunecc");
@@ -1922,6 +2242,58 @@ bool rewriteKernelSources(const EventDB &db, llvm::StringRef outDir) {
 
   llvm::StringMap<llvm::SmallVector<Replacement, 4>> replacementsByFile;
   llvm::StringSet<> filesToRewrite;
+  llvm::StringSet<> filesWithKernelReplace;
+  auto whitespaceOnly = [](llvm::StringRef text) {
+    for (char c : text) {
+      if (c != ' ' && c != '\t' && c != '\n' && c != '\r')
+        return false;
+    }
+    return true;
+  };
+
+  auto findKernelInterval =
+      [&](llvm::StringRef filePath, llvm::StringRef tag,
+          unsigned blockBegin, unsigned blockEnd) -> const KernelInterval * {
+    const KernelInterval *match = nullptr;
+    for (const auto &kernel : db.kernels) {
+      if (kernel.begin.tag != tag || kernel.begin.filePath != filePath)
+        continue;
+      if (kernel.begin.fileOffset < blockBegin ||
+          kernel.end.fileOffset > blockEnd)
+        continue;
+      if (match)
+        return nullptr;
+      match = &kernel;
+    }
+    return match;
+  };
+
+  auto findHaloInterval =
+      [&](llvm::StringRef filePath, llvm::StringRef tag,
+          unsigned blockBegin, unsigned blockEnd) -> const HaloInterval * {
+    const HaloInterval *match = nullptr;
+    for (const auto &halo : db.halos) {
+      if (halo.begin.tag != tag || halo.begin.filePath != filePath)
+        continue;
+      if (halo.begin.fileOffset < blockBegin ||
+          halo.end.fileOffset > blockEnd)
+        continue;
+      if (match)
+        return nullptr;
+      match = &halo;
+    }
+    return match;
+  };
+
+  llvm::StringMap<llvm::SmallVector<const OverlapInterval *, 4>>
+      overlapsByFile;
+  for (const auto &ov : db.overlaps) {
+    if (!ov.blockBegin.isValid() || !ov.blockEnd.isValid())
+      continue;
+    if (ov.begin.filePath.empty())
+      continue;
+    overlapsByFile[ov.begin.filePath].push_back(&ov);
+  }
   for (const auto &kernel : db.kernels) {
     if (!kernel.blockBegin.isValid() || !kernel.blockEnd.isValid()) {
       continue;
@@ -1954,6 +2326,23 @@ bool rewriteKernelSources(const EventDB &db, llvm::StringRef outDir) {
     if (filePath.empty()) {
       llvm::errs() << "neptune-cc: missing source path for kernel '" << tag
                    << "'\n";
+      continue;
+    }
+
+    bool coveredByOverlap = false;
+    auto ovIt = overlapsByFile.find(filePath);
+    if (ovIt != overlapsByFile.end()) {
+      for (const OverlapInterval *ov : ovIt->second) {
+        if (ov->kernelTag != tag)
+          continue;
+        if (kernel.begin.fileOffset >= ov->blockBeginOffset &&
+            kernel.end.fileOffset <= ov->blockEndOffset) {
+          coveredByOverlap = true;
+          break;
+        }
+      }
+    }
+    if (coveredByOverlap) {
       continue;
     }
 
@@ -1997,6 +2386,141 @@ bool rewriteKernelSources(const EventDB &db, llvm::StringRef outDir) {
     emitKernelCall(rso, *it->second);
     rso << newline;
     replacementsByFile[filePath].push_back(std::move(repl));
+    filesWithKernelReplace.insert(filePath);
+  }
+
+  for (auto &entry : overlapsByFile) {
+    llvm::StringRef filePath = entry.getKey();
+    auto bufferOrErr = llvm::MemoryBuffer::getFile(filePath);
+    if (!bufferOrErr) {
+      llvm::errs() << "neptune-cc: failed to read source '" << filePath
+                   << "': " << bufferOrErr.getError().message() << "\n";
+      continue;
+    }
+    llvm::StringRef contentRef = bufferOrErr.get()->getBuffer();
+
+    for (const OverlapInterval *ov : entry.getValue()) {
+      if (ov->kernelTag.empty() || ov->haloTag.empty()) {
+        llvm::errs() << "neptune-cc: skip overlap rewrite for tag '"
+                     << ov->begin.tag << "' (missing halo/kernel)\n";
+        continue;
+      }
+      if (ov->blockBeginOffset >= ov->blockEndOffset) {
+        llvm::errs() << "neptune-cc: skip overlap rewrite for tag '"
+                     << ov->begin.tag << "' (invalid block)\n";
+        continue;
+      }
+
+      auto kInfoIt = kernelByTag.find(ov->kernelTag);
+      if (kInfoIt == kernelByTag.end()) {
+        llvm::errs() << "neptune-cc: skip overlap rewrite for tag '"
+                     << ov->begin.tag << "' (missing kernel info)\n";
+        continue;
+      }
+      const KernelInfo *kinfo = kInfoIt->second;
+      if (!kinfo->boundsValid || !kinfo->overlapSupported) {
+        llvm::errs() << "neptune-cc: skip overlap rewrite for tag '"
+                     << ov->begin.tag << "' ("
+                     << (kinfo->overlapReason.empty()
+                             ? "overlap unsupported"
+                             : kinfo->overlapReason)
+                     << ")\n";
+        continue;
+      }
+
+      const KernelInterval *kInterval = findKernelInterval(
+          filePath, ov->kernelTag, ov->blockBeginOffset, ov->blockEndOffset);
+      if (!kInterval) {
+        llvm::errs() << "neptune-cc: skip overlap rewrite for tag '"
+                     << ov->begin.tag << "' (kernel not uniquely inside)\n";
+        continue;
+      }
+      const HaloInterval *hInterval = findHaloInterval(
+          filePath, ov->haloTag, ov->blockBeginOffset, ov->blockEndOffset);
+      if (!hInterval) {
+        llvm::errs() << "neptune-cc: skip overlap rewrite for tag '"
+                     << ov->begin.tag << "' (halo not uniquely inside)\n";
+        continue;
+      }
+
+      size_t blockBodyStart = findLineEnd(contentRef, ov->blockBeginOffset);
+      size_t blockBodyEnd = findLineStart(contentRef, ov->blockEndOffset);
+      size_t haloBeginLineEnd =
+          findLineEnd(contentRef, hInterval->begin.fileOffset);
+      size_t haloEndLineStart =
+          findLineStart(contentRef, hInterval->end.fileOffset);
+      size_t haloEndLineEnd =
+          findLineEnd(contentRef, hInterval->end.fileOffset);
+      size_t kernelBeginLineStart =
+          findLineStart(contentRef, kInterval->begin.fileOffset);
+      size_t kernelEndLineEnd =
+          findLineEnd(contentRef, kInterval->end.fileOffset);
+
+      if (!(blockBodyStart <= haloBeginLineEnd &&
+            haloBeginLineEnd <= kernelBeginLineStart &&
+            kernelBeginLineStart <= kernelEndLineEnd &&
+            kernelEndLineEnd <= haloEndLineStart &&
+            haloEndLineStart <= blockBodyEnd)) {
+        llvm::errs() << "neptune-cc: skip overlap rewrite for tag '"
+                     << ov->begin.tag << "' (unexpected ordering)\n";
+        continue;
+      }
+
+      llvm::StringRef midGap =
+          contentRef.slice(kernelEndLineEnd, haloEndLineStart);
+      if (!whitespaceOnly(midGap)) {
+        llvm::errs() << "neptune-cc: skip overlap rewrite for tag '"
+                     << ov->begin.tag << "' (extra statements between kernel "
+                     << "and halo end)\n";
+        continue;
+      }
+
+      llvm::StringRef beginStatements =
+          contentRef.slice(haloBeginLineEnd, kernelBeginLineStart);
+      llvm::StringRef endStatements =
+          contentRef.slice(haloEndLineEnd, blockBodyEnd);
+
+      size_t indentStart = findLineStart(contentRef, ov->blockBeginOffset);
+      size_t indentEnd = indentStart;
+      while (indentEnd < contentRef.size() &&
+             (contentRef[indentEnd] == ' ' ||
+              contentRef[indentEnd] == '\t')) {
+        ++indentEnd;
+      }
+      llvm::StringRef indent =
+          contentRef.slice(indentStart,
+                           std::min(indentEnd, contentRef.size()));
+      std::string newline = detectNewline(contentRef);
+
+      Replacement repl;
+      repl.start = ov->blockBeginOffset;
+      repl.end = ov->blockEndOffset;
+      llvm::raw_string_ostream rso(repl.text);
+      rso << indent << "{" << newline;
+      rso << beginStatements;
+      rso << indent << "  neptunecc::" << kinfo->tag << "_interior(";
+      for (size_t i = 0; i < kinfo->ports.size(); ++i) {
+        if (i)
+          rso << ", ";
+        emitArrayArg(rso, kinfo->ports[i].name, kinfo->ports[i].rank);
+      }
+      rso << ");" << newline;
+      rso << endStatements;
+      for (const auto &face : kinfo->overlapFaces) {
+        rso << indent << "  neptunecc::" << kinfo->tag << "_"
+            << face.suffix << "(";
+        for (size_t i = 0; i < kinfo->ports.size(); ++i) {
+          if (i)
+            rso << ", ";
+          emitArrayArg(rso, kinfo->ports[i].name, kinfo->ports[i].rank);
+        }
+        rso << ");" << newline;
+      }
+      rso << indent << "}" << newline;
+      replacementsByFile[filePath].push_back(std::move(repl));
+      filesToRewrite.insert(filePath);
+      filesWithKernelReplace.insert(filePath);
+    }
   }
 
   if (filesToRewrite.empty()) {
@@ -2036,7 +2560,9 @@ bool rewriteKernelSources(const EventDB &db, llvm::StringRef outDir) {
         content.replace(repl.start, repl.end - repl.start, repl.text);
       }
 
-      ensureKernelInclude(content);
+      if (filesWithKernelReplace.contains(filePath)) {
+        ensureKernelInclude(content);
+      }
     }
 
     llvm::SmallString<256> outPath(rewriteDir);

@@ -109,7 +109,7 @@ static Value buildIntLiteral(OpBuilder &b, Location loc, int64_t value) {
 }
 
 struct ScheduleAttr {
-  llvm::SmallVector<int64_t, 4> tile;
+  llvm::SmallVector<int64_t, 4> split;
   int64_t vec = 1;
   int64_t unroll = 1;
   int64_t threads = 1;
@@ -124,13 +124,13 @@ static ScheduleAttr parseScheduleAttr(ApplyOp apply, size_t rank) {
   if (!dict)
     return info;
 
-  auto tileAttr = dict.getAs<DenseI64ArrayAttr>("tile");
-  if (!tileAttr)
+  auto splitAttr = dict.getAs<DenseI64ArrayAttr>("split");
+  if (!splitAttr)
     return info;
-  auto tileVals = tileAttr.asArrayRef();
-  if (tileVals.size() != rank)
+  auto splitVals = splitAttr.asArrayRef();
+  if (splitVals.size() != rank)
     return info;
-  info.tile.assign(tileVals.begin(), tileVals.end());
+  info.split.assign(splitVals.begin(), splitVals.end());
 
   if (auto vecAttr = dict.getAs<IntegerAttr>("vec"))
     info.vec = vecAttr.getInt();
@@ -537,7 +537,7 @@ static LogicalResult emitOneKernel(OpBuilder &b, func::FuncOp func,
       llvm::SmallVector<Value, 6> args;
       args.push_back(outFunc);
       if (rank == 1) {
-        args.push_back(buildIntLiteral(b, loc, schedule.tile[0]));
+        args.push_back(buildIntLiteral(b, loc, schedule.split[0]));
         args.push_back(buildIntLiteral(b, loc, schedule.vec));
         args.push_back(buildIntLiteral(b, loc, enableParallel));
         args.push_back(buildIntLiteral(b, loc, schedule.threads));
@@ -545,8 +545,8 @@ static LogicalResult emitOneKernel(OpBuilder &b, func::FuncOp func,
         b.create<emitc::CallOpaqueOp>(loc, TypeRange{},
                                       "neptune_halide::schedule_1d", args);
       } else if (rank == 2) {
-        int64_t tx = schedule.tile[1];
-        int64_t ty = schedule.tile[0];
+        int64_t tx = schedule.split[1];
+        int64_t ty = schedule.split[0];
         args.push_back(buildIntLiteral(b, loc, tx));
         args.push_back(buildIntLiteral(b, loc, ty));
         args.push_back(buildIntLiteral(b, loc, schedule.vec));
@@ -556,9 +556,9 @@ static LogicalResult emitOneKernel(OpBuilder &b, func::FuncOp func,
         b.create<emitc::CallOpaqueOp>(loc, TypeRange{},
                                       "neptune_halide::schedule_2d", args);
       } else if (rank == 3) {
-        int64_t tx = schedule.tile[2];
-        int64_t ty = schedule.tile[1];
-        int64_t tz = schedule.tile[0];
+        int64_t tx = schedule.split[2];
+        int64_t ty = schedule.split[1];
+        int64_t tz = schedule.split[0];
         args.push_back(buildIntLiteral(b, loc, tx));
         args.push_back(buildIntLiteral(b, loc, ty));
         args.push_back(buildIntLiteral(b, loc, tz));

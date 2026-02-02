@@ -46,6 +46,9 @@ public:
   void HandleTranslationUnit(clang::ASTContext &Ctx) override {
     neptune::pairKernels(localDb, Ctx.getDiagnostics());
     neptune::bindKernelsToBlocks(localDb, Ctx);
+    neptune::pairHalos(localDb, Ctx.getDiagnostics());
+    neptune::pairOverlaps(localDb, Ctx.getDiagnostics());
+    neptune::bindOverlapsToBlocks(localDb, Ctx);
     neptune::lowerKernelsToMLIR(localDb, Ctx, outDb);
     outDb.kernels.append(localDb.kernels.begin(), localDb.kernels.end());
   }

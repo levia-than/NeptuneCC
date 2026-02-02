@@ -14,9 +14,9 @@ Date: 2026-01-29
 
 | Experiment | Env | Schedule summary | Baseline elapsed_ms | Generated elapsed_ms |
 |---|---|---|---:|---:|
-| default | `` | `neptune-cc: schedule for 'k0' rank=2 shape=[2048,2048] outMin=[1,1] outExtent=[2046,2046] radius=[1,1] elem_bytes=4 tile=[64,16] vec=1 par=none unroll=4 (VL defaulted: set NEPTUNECC_VECTOR_WIDTH for target VL)` | n/a | n/a |
-| VL=8, threads=4 | `NEPTUNECC_VECTOR_WIDTH=8 NEPTUNECC_THREADS=4` | `neptune-cc: schedule for 'k0' rank=2 shape=[2048,2048] outMin=[1,1] outExtent=[2046,2046] radius=[1,1] elem_bytes=4 tile=[64,32] vec=8 par=y unroll=2` | n/a | n/a |
-| VL=8, threads=8 | `NEPTUNECC_VECTOR_WIDTH=8 NEPTUNECC_THREADS=8` | `neptune-cc: schedule for 'k0' rank=2 shape=[2048,2048] outMin=[1,1] outExtent=[2046,2046] radius=[1,1] elem_bytes=4 tile=[64,32] vec=8 par=y unroll=2` | n/a | n/a |
+| default | `` | `neptune-cc: schedule for 'k0' rank=2 shape=[2048,2048] outMin=[1,1] outExtent=[2046,2046] radius=[1,1] elem_bytes=4 split=[64,16] vec=1 par=none unroll=4 (VL defaulted: set NEPTUNECC_VECTOR_WIDTH for target VL)` | n/a | n/a |
+| VL=8, threads=4 | `NEPTUNECC_VECTOR_WIDTH=8 NEPTUNECC_THREADS=4` | `neptune-cc: schedule for 'k0' rank=2 shape=[2048,2048] outMin=[1,1] outExtent=[2046,2046] radius=[1,1] elem_bytes=4 split=[64,32] vec=8 par=y unroll=2` | n/a | n/a |
+| VL=8, threads=8 | `NEPTUNECC_VECTOR_WIDTH=8 NEPTUNECC_THREADS=8` | `neptune-cc: schedule for 'k0' rank=2 shape=[2048,2048] outMin=[1,1] outExtent=[2046,2046] radius=[1,1] elem_bytes=4 split=[64,32] vec=8 par=y unroll=2` | n/a | n/a |
 
 ## Notes
 

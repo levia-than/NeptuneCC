@@ -8,9 +8,10 @@
  * 
  * Copyright (c) 2025 by ${git_name_email}, All Rights Reserved. 
 -->
-# NeptuneCC PDE solver
+# NeptuneCC stencil compiler
 
-NeptuneCC is an MLIR/LLVM toolchain for stencil/PDE kernels. It ships the
+NeptuneCC is an MLIR/LLVM toolchain for stencil kernels and structured grid
+computations. It ships the
 NeptuneIR dialect and passes, the `neptune-opt` driver, and the `neptune-cc`
 Clang frontend for `#pragma neptune`. Runtime integration is currently out of
 tree.

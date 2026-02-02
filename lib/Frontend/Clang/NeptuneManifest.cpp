@@ -9,10 +9,20 @@
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
+#include <optional>
 #include <system_error>
 #include <utility>
 
 namespace neptune {
+
+static std::optional<llvm::StringRef>
+getClauseValue(const Event &event, llvm::StringRef key) {
+  for (const auto &clause : event.clauses) {
+    if (clause.key == key)
+      return llvm::StringRef(clause.val);
+  }
+  return std::nullopt;
+}
 
 static bool writeKernelsMLIR(const EventDB &db, llvm::StringRef outDir) {
   llvm::SmallString<256> outputPath(outDir);
@@ -115,6 +125,8 @@ bool writeManifest(const EventDB &db, llvm::StringRef outDir,
   }
 
   llvm::json::Array kernels;
+  llvm::json::Array haloBlocks;
+  llvm::json::Array overlaps;
   for (const auto &kernel : db.kernels) {
     if (!kernel.blockBegin.isValid() || !kernel.blockEnd.isValid()) {
       continue;
@@ -141,9 +153,47 @@ bool writeManifest(const EventDB &db, llvm::StringRef outDir,
     kernels.push_back(std::move(obj));
   }
 
+  for (const auto &halo : db.halos) {
+    llvm::json::Object obj;
+    obj["tag"] = halo.begin.tag;
+    obj["file"] = halo.begin.filePath;
+    obj["begin_offset"] = static_cast<uint64_t>(halo.begin.fileOffset);
+    obj["end_offset"] = static_cast<uint64_t>(halo.end.fileOffset);
+
+    if (auto dm = getClauseValue(halo.begin, "dm"))
+      obj["dm"] = *dm;
+    if (auto field = getClauseValue(halo.begin, "field"))
+      obj["field"] = *field;
+    if (auto kind = getClauseValue(halo.begin, "kind"))
+      obj["kind"] = *kind;
+    if (auto radius = getClauseValue(halo.begin, "radius"))
+      obj["radius"] = *radius;
+    if (auto ports = getClauseValue(halo.begin, "ports"))
+      obj["ports"] = *ports;
+    if (auto mode = getClauseValue(halo.begin, "mode"))
+      obj["mode"] = *mode;
+
+    haloBlocks.push_back(std::move(obj));
+  }
+
+  for (const auto &ov : db.overlaps) {
+    llvm::json::Object obj;
+    obj["tag"] = ov.begin.tag;
+    obj["kernel_tag"] = ov.kernelTag;
+    obj["halo_tag"] = ov.haloTag;
+    obj["file"] = ov.begin.filePath;
+    obj["begin_offset"] = static_cast<uint64_t>(ov.begin.fileOffset);
+    obj["end_offset"] = static_cast<uint64_t>(ov.end.fileOffset);
+    obj["block_begin_offset"] = static_cast<uint64_t>(ov.blockBeginOffset);
+    obj["block_end_offset"] = static_cast<uint64_t>(ov.blockEndOffset);
+    overlaps.push_back(std::move(obj));
+  }
+
   llvm::json::Object root;
   root["version"] = 1;
   root["kernels"] = std::move(kernels);
+  root["halo_blocks"] = std::move(haloBlocks);
+  root["overlaps"] = std::move(overlaps);
   os << llvm::json::Value(std::move(root)) << "\n";
 
   if (!writeKernelsMLIR(db, outputDir)) {

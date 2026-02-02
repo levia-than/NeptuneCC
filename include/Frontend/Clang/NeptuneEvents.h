@@ -9,7 +9,14 @@
 
 namespace neptune {
 
-enum class EventKind { KernelBegin, KernelEnd };
+enum class EventKind {
+  KernelBegin,
+  KernelEnd,
+  HaloBegin,
+  HaloEnd,
+  OverlapBegin,
+  OverlapEnd
+};
 
 struct ClauseKV {
   llvm::SmallString<32> key;
@@ -36,9 +43,27 @@ struct KernelInterval {
   unsigned blockEndOffset = 0;
 };
 
+struct HaloInterval {
+  Event begin;
+  Event end;
+};
+
+struct OverlapInterval {
+  Event begin;
+  Event end;
+  clang::SourceLocation blockBegin;
+  clang::SourceLocation blockEnd;
+  unsigned blockBeginOffset = 0;
+  unsigned blockEndOffset = 0;
+  llvm::SmallString<64> haloTag;
+  llvm::SmallString<64> kernelTag;
+};
+
 struct EventDB {
   llvm::SmallVector<Event, 32> events;
   llvm::SmallVector<KernelInterval, 16> kernels;
+  llvm::SmallVector<HaloInterval, 16> halos;
+  llvm::SmallVector<OverlapInterval, 8> overlaps;
   std::unique_ptr<mlir::MLIRContext> mlirContext;
   mlir::OwningOpRef<mlir::ModuleOp> kernelModule;
 };

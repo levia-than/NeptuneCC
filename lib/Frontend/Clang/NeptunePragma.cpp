@@ -34,7 +34,13 @@ void NeptunePragmaHandler::HandlePragma(Preprocessor &PP,
   }
 
   clang::IdentifierInfo *firstIdent = FirstToken.getIdentifierInfo();
-  if (!firstIdent || firstIdent->getName() != "kernel") {
+  if (!firstIdent) {
+    consumeToEOD(PP);
+    return;
+  }
+  llvm::StringRef pragmaKind = firstIdent->getName();
+  if (pragmaKind != "kernel" && pragmaKind != "halo" &&
+      pragmaKind != "overlap") {
     consumeToEOD(PP);
     return;
   }
@@ -49,9 +55,21 @@ void NeptunePragmaHandler::HandlePragma(Preprocessor &PP,
   llvm::StringRef kind = KindTok.getIdentifierInfo()->getName();
   Event event;
   if (kind == "begin") {
-    event.kind = EventKind::KernelBegin;
+    if (pragmaKind == "kernel") {
+      event.kind = EventKind::KernelBegin;
+    } else if (pragmaKind == "halo") {
+      event.kind = EventKind::HaloBegin;
+    } else {
+      event.kind = EventKind::OverlapBegin;
+    }
   } else if (kind == "end") {
-    event.kind = EventKind::KernelEnd;
+    if (pragmaKind == "kernel") {
+      event.kind = EventKind::KernelEnd;
+    } else if (pragmaKind == "halo") {
+      event.kind = EventKind::HaloEnd;
+    } else {
+      event.kind = EventKind::OverlapEnd;
+    }
   } else {
     consumeToEOD(PP);
     return;
