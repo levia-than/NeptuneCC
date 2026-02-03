@@ -50,6 +50,7 @@ static bool matchConstantIndex(Value v, int64_t &out) {
 }
 
 static bool evalIndexExpr(Value v, int64_t &out) {
+  // Conservative evaluator for index expressions used in loop bounds.
   if (matchConstantIndex(v, out))
     return true;
 
@@ -83,6 +84,7 @@ static bool evalIndexExpr(Value v, int64_t &out) {
 }
 
 static bool matchIndexOffset(Value idx, Value iv, int64_t &offset) {
+  // Accept iv, iv + c, iv - c only.
   if (idx == iv) {
     offset = 0;
     return true;
@@ -142,6 +144,7 @@ static bool isLoopInvariantAcross(Value cond,
 static bool collectStoresAndCheckRegion(Region &region,
                                         llvm::DenseSet<Value> &stores,
                                         std::string &reason) {
+  // Only allow side-effect free ops plus memref.load/store and simple arith.
   for (Block &block : region) {
     for (Operation &op : block) {
       if (op.hasTrait<OpTrait::IsTerminator>())
@@ -191,6 +194,7 @@ static bool collectStoresAndCheckRegion(Region &region,
 
 static bool checkBranchAccesses(Region &region, Value ivI, Value ivJ,
                                 int64_t r, std::string &reason) {
+  // Ensure accesses are within radius and use only iv +/- const.
   for (Block &block : region) {
     for (Operation &op : block) {
       if (op.hasTrait<OpTrait::IsTerminator>())
@@ -283,6 +287,7 @@ static bool checkBranchAccesses(Region &region, Value ivI, Value ivJ,
 static bool checkBranchAccesses3D(Region &region, Value ivI, Value ivJ,
                                   Value ivK, int64_t r,
                                   std::string &reason) {
+  // 3D variant of access/radius checks used by peeling.
   for (Block &block : region) {
     for (Operation &op : block) {
       if (op.hasTrait<OpTrait::IsTerminator>())
@@ -380,6 +385,7 @@ static bool checkBranchAccesses3D(Region &region, Value ivI, Value ivJ,
 
 static bool checkBranchAccesses1D(Region &region, Value ivI, int64_t r,
                                   std::string &reason) {
+  // 1D variant of access/radius checks used by peeling.
   for (Block &block : region) {
     for (Operation &op : block) {
       if (op.hasTrait<OpTrait::IsTerminator>())
@@ -494,6 +500,7 @@ static bool parseBoundaryCmp(arith::CmpIOp cmp, Value ivI, Value ivJ,
                              int64_t lbI, int64_t ubI, int64_t lbJ,
                              int64_t ubJ, int64_t &rOut, int &dimOut,
                              std::string &reason) {
+  // Decode boundary predicate into (dim, radius) if it is a supported form.
   Value lhs = cmp.getLhs();
   Value rhs = cmp.getRhs();
   arith::CmpIPredicate pred = cmp.getPredicate();
@@ -583,6 +590,7 @@ static bool parseBoundaryCmp3D(arith::CmpIOp cmp, Value ivI, Value ivJ,
                                int64_t lbJ, int64_t ubJ, int64_t lbK,
                                int64_t ubK, int64_t &rOut, int &dimOut,
                                std::string &reason) {
+  // 3D variant of boundary predicate parsing.
   Value lhs = cmp.getLhs();
   Value rhs = cmp.getRhs();
   arith::CmpIPredicate pred = cmp.getPredicate();
@@ -708,6 +716,7 @@ static bool collectBoundaryConds(Value cond, Value ivI, Value ivJ, int64_t lbI,
                                  int64_t ubI, int64_t lbJ, int64_t ubJ,
                                  int64_t &radius, bool &seenI, bool &seenJ,
                                  std::string &reason) {
+  // Accept only OR of boundary comparisons; reject AND to keep it simple.
   Operation *def = cond.getDefiningOp();
   if (!def) {
     reason = "condition not defined by op";
@@ -757,6 +766,7 @@ static bool collectBoundaryConds3D(Value cond, Value ivI, Value ivJ,
                                    int64_t ubK, int64_t &radius, bool &seenI,
                                    bool &seenJ, bool &seenK,
                                    std::string &reason) {
+  // 3D variant of boundary condition collection.
   Operation *def = cond.getDefiningOp();
   if (!def) {
     reason = "condition not defined by op";
@@ -888,6 +898,7 @@ static bool parseBoundaryCmp1D(arith::CmpIOp cmp, Value ivI, int64_t lbI,
 static bool collectBoundaryConds1D(Value cond, Value ivI, int64_t lbI,
                                    int64_t ubI, int64_t &radius,
                                    std::string &reason) {
+  // 1D variant: OR of boundary comparisons.
   Operation *def = cond.getDefiningOp();
   if (!def) {
     reason = "condition not defined by op";
@@ -929,6 +940,7 @@ static void cloneRegionOps(Region &src, OpBuilder &b, IRMapping &mapping);
 static scf::ForOp buildLoopWithBranch1D(OpBuilder &b, Location loc, Value lbI,
                                         Value ubI, Value step, Region &branch,
                                         Value oldI) {
+  // Clone a 1D loop and replace iv with the new loop iv.
   auto loop = b.create<scf::ForOp>(loc, lbI, ubI, step);
   IRMapping mapping;
   mapping.map(oldI, loop.getInductionVar());
@@ -1033,6 +1045,7 @@ static scf::ForOp buildLoopNestWithBranch(OpBuilder &b, Location loc,
                                           Value ubJ, Value step,
                                           Region &branch, Value oldI,
                                           Value oldJ) {
+  // Clone a 2D loop nest and remap ivs to the new loops.
   auto outer = b.create<scf::ForOp>(loc, lbI, ubI, step);
   OpBuilder innerBuilder = OpBuilder::atBlockBegin(outer.getBody());
   auto inner = innerBuilder.create<scf::ForOp>(loc, lbJ, ubJ, step);
@@ -1053,6 +1066,7 @@ static scf::ForOp buildLoopNestWithBranch3D(OpBuilder &b, Location loc,
                                             Value step, Region &branch,
                                             Value oldI, Value oldJ,
                                             Value oldK) {
+  // Clone a 3D loop nest and remap ivs to the new loops.
   auto outer = b.create<scf::ForOp>(loc, lbI, ubI, step);
   OpBuilder middleBuilder = OpBuilder::atBlockBegin(outer.getBody());
   auto middle = middleBuilder.create<scf::ForOp>(loc, lbJ, ubJ, step);
@@ -1071,6 +1085,7 @@ static scf::ForOp buildLoopNestWithBranch3D(OpBuilder &b, Location loc,
 }
 
 static bool tryPeel3D(func::FuncOp func, SummaryInfo &summary) {
+  // Match a simple 3D loop+if boundary pattern and peel into faces+interior.
   for (auto outer : func.getOps<scf::ForOp>()) {
     if (!outer.getResults().empty())
       continue;
@@ -1286,7 +1301,7 @@ static bool tryPeel3D(func::FuncOp func, SummaryInfo &summary) {
     Value lbKPlusR = b.create<arith::ConstantIndexOp>(loc, lbK + radius);
     Value ubKMinusR = b.create<arith::ConstantIndexOp>(loc, ubK - radius);
 
-    // K slabs
+    // K slabs (full I/J, thin K faces).
     buildLoopNestWithBranch3D(b, loc, lbIVal, ubIVal, lbJVal, ubJVal, lbKVal,
                               lbKPlusR, step, ifOp.getThenRegion(),
                               outer.getInductionVar(),
@@ -1297,7 +1312,7 @@ static bool tryPeel3D(func::FuncOp func, SummaryInfo &summary) {
                               outer.getInductionVar(),
                               middle.getInductionVar(),
                               inner.getInductionVar());
-    // J slabs (K interior)
+    // J slabs (K interior).
     buildLoopNestWithBranch3D(b, loc, lbIVal, ubIVal, lbJVal, lbJPlusR,
                               lbKPlusR, ubKMinusR, step, ifOp.getThenRegion(),
                               outer.getInductionVar(),
@@ -1308,7 +1323,7 @@ static bool tryPeel3D(func::FuncOp func, SummaryInfo &summary) {
                               outer.getInductionVar(),
                               middle.getInductionVar(),
                               inner.getInductionVar());
-    // I slabs (J/K interior)
+    // I slabs (J/K interior).
     buildLoopNestWithBranch3D(b, loc, lbIVal, lbIPlusR, lbJPlusR, ubJMinusR,
                               lbKPlusR, ubKMinusR, step, ifOp.getThenRegion(),
                               outer.getInductionVar(),
@@ -1319,7 +1334,7 @@ static bool tryPeel3D(func::FuncOp func, SummaryInfo &summary) {
                               outer.getInductionVar(),
                               middle.getInductionVar(),
                               inner.getInductionVar());
-    // Interior
+    // Interior stencil (no boundary guards).
     buildLoopNestWithBranch3D(b, loc, lbIPlusR, ubIMinusR, lbJPlusR, ubJMinusR,
                               lbKPlusR, ubKMinusR, step, ifOp.getElseRegion(),
                               outer.getInductionVar(),
@@ -1346,6 +1361,7 @@ static bool tryPeel3D(func::FuncOp func, SummaryInfo &summary) {
 }
 
 static bool tryPeel(func::FuncOp func, SummaryInfo &summary) {
+  // 2D peel: boundary if into strips + interior.
   for (auto outer : func.getOps<scf::ForOp>()) {
     if (!outer.getResults().empty())
       continue;
@@ -1500,23 +1516,23 @@ static bool tryPeel(func::FuncOp func, SummaryInfo &summary) {
     Value lbJPlusR = b.create<arith::ConstantIndexOp>(loc, lbJ + radius);
     Value ubJMinusR = b.create<arith::ConstantIndexOp>(loc, ubJ - radius);
 
-    // Top strip
+    // Top strip.
     buildLoopNestWithBranch(b, loc, lbIVal, lbIPlusR, lbJVal, ubJVal, step,
                             ifOp.getThenRegion(), outer.getInductionVar(),
                             inner.getInductionVar());
-    // Bottom strip
+    // Bottom strip.
     buildLoopNestWithBranch(b, loc, ubIMinusR, ubIVal, lbJVal, ubJVal, step,
                             ifOp.getThenRegion(), outer.getInductionVar(),
                             inner.getInductionVar());
-    // Middle-left strip
+    // Middle-left strip.
     buildLoopNestWithBranch(b, loc, lbIPlusR, ubIMinusR, lbJVal, lbJPlusR, step,
                             ifOp.getThenRegion(), outer.getInductionVar(),
                             inner.getInductionVar());
-    // Middle-right strip
+    // Middle-right strip.
     buildLoopNestWithBranch(b, loc, lbIPlusR, ubIMinusR, ubJMinusR, ubJVal, step,
                             ifOp.getThenRegion(), outer.getInductionVar(),
                             inner.getInductionVar());
-    // Interior
+    // Interior stencil (no boundary guards).
     buildLoopNestWithBranch(b, loc, lbIPlusR, ubIMinusR, lbJPlusR, ubJMinusR,
                             step, ifOp.getElseRegion(),
                             outer.getInductionVar(), inner.getInductionVar());
@@ -1540,6 +1556,7 @@ static bool tryPeel(func::FuncOp func, SummaryInfo &summary) {
 }
 
 static bool tryPeel1D(func::FuncOp func, SummaryInfo &summary) {
+  // 1D peel: boundary if into two endpoints + interior.
   for (auto loop : func.getOps<scf::ForOp>()) {
     if (!loop.getResults().empty())
       continue;
@@ -1681,6 +1698,7 @@ static bool cloneLoopWithIfBranch(scf::ForOp loop, scf::IfOp ifOp,
 }
 
 static bool tryUnswitch(func::FuncOp func, SummaryInfo &summary) {
+  // Unswitch only when condition is loop-invariant and side-effect safe.
   bool changed = false;
 
   std::vector<scf::IfOp> ifOps;

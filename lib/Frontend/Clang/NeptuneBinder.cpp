@@ -50,6 +50,7 @@ void pairKernels(EventDB &db, clang::DiagnosticsEngine &DE) {
       continue;
     }
 
+    // Stack per tag to support nesting; each end pops the latest begin.
     llvm::StringRef tag = event.tag;
     if (event.kind == EventKind::KernelBegin) {
       stacks[tag].push_back(event);
@@ -104,6 +105,7 @@ void pairHalos(EventDB &db, clang::DiagnosticsEngine &DE) {
       DE.Report(event.loc, diagMissingTag);
       continue;
     }
+    // Pair halo begin/end strictly by tag, same as kernels.
     llvm::StringRef tag = event.tag;
     if (event.kind == EventKind::HaloBegin) {
       stacks[tag].push_back(event);
@@ -161,6 +163,7 @@ void pairOverlaps(EventDB &db, clang::DiagnosticsEngine &DE) {
       DE.Report(event.loc, diagMissingTag);
       continue;
     }
+    // Overlap requires begin/end plus kernel/halo tags on begin.
     llvm::StringRef tag = event.tag;
     if (event.kind == EventKind::OverlapBegin) {
       stacks[tag].push_back(event);
@@ -178,6 +181,7 @@ void pairOverlaps(EventDB &db, clang::DiagnosticsEngine &DE) {
     interval.begin = begin;
     interval.end = event;
 
+    // Extract required overlap metadata from begin clauses.
     llvm::StringRef kernelTag = getClauseValue(begin, "kernel");
     if (kernelTag.empty()) {
       DE.Report(begin.loc, diagMissingKernel) << begin.tag;
@@ -264,6 +268,7 @@ void bindKernelsToBlocks(EventDB &db, clang::ASTContext &Ctx) {
     BlockInfo *best = nullptr;
     unsigned bestBegin = std::numeric_limits<unsigned>::max();
     uint64_t bestRange = std::numeric_limits<uint64_t>::max();
+    // Choose the smallest block fully contained in the pragma range.
     for (auto &block : blocks) {
       if (block.beginOffset < kernel.begin.fileOffset) {
         continue;
@@ -309,6 +314,7 @@ void bindOverlapsToBlocks(EventDB &db, clang::ASTContext &Ctx) {
     BlockInfo *best = nullptr;
     unsigned bestBegin = std::numeric_limits<unsigned>::max();
     uint64_t bestRange = std::numeric_limits<uint64_t>::max();
+    // Same heuristic as kernels: pick the smallest enclosing block.
     for (auto &block : blocks) {
       if (block.beginOffset < overlap.begin.fileOffset) {
         continue;

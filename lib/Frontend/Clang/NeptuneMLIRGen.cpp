@@ -43,6 +43,7 @@ static bool getBlockOffsets(const clang::CompoundStmt *CS,
                             clang::SourceManager &SM,
                             const clang::LangOptions &LangOpts,
                             unsigned &beginOffset, unsigned &endOffset) {
+  // Use the braces to identify the exact source range for rewrite.
   clang::SourceLocation lBrace = CS->getLBracLoc();
   clang::SourceLocation rBrace = CS->getRBracLoc();
   if (lBrace.isInvalid() || rBrace.isInvalid()) {
@@ -92,6 +93,7 @@ public:
       return true;
     }
     if (beginOffset == targetBegin && endOffset == targetEnd) {
+      // Exact match on block offsets uniquely identifies the kernel block.
       match.block = CS;
       match.func = currentFunc;
       return false;
@@ -110,6 +112,7 @@ private:
 };
 
 static void ensureKernelModule(EventDB &db) {
+  // Lazily create MLIR context/module with the dialects we emit.
   if (!db.mlirContext) {
     db.mlirContext = std::make_unique<mlir::MLIRContext>();
     db.mlirContext->getOrLoadDialect<mlir::func::FuncDialect>();
@@ -126,6 +129,7 @@ static void ensureKernelModule(EventDB &db) {
 static void applyKernelAttrs(mlir::Operation *op,
                              const KernelInterval &kernel,
                              mlir::OpBuilder &builder) {
+  // Persist pragma metadata on the MLIR func for later codegen.
   llvm::StringRef tag = kernel.begin.tag;
   llvm::StringRef name =
       kernel.begin.name.empty() ? kernel.begin.tag : kernel.begin.name;
@@ -157,6 +161,7 @@ static void applyKernelAttrs(mlir::Operation *op,
 static bool extractArrayInfo(clang::ASTContext &Ctx, clang::QualType type,
                              llvm::SmallVectorImpl<int64_t> &shape,
                              clang::QualType &elemType) {
+  // Flatten constant array types into shape + element type.
   shape.clear();
   clang::QualType cur = type;
   while (const auto *arr = Ctx.getAsConstantArrayType(cur)) {
@@ -188,6 +193,7 @@ static bool parsePortClause(llvm::StringRef clauseVal, bool isInput,
                             unsigned diagInvalidPort,
                             unsigned diagDuplicatePort,
                             clang::SourceLocation loc) {
+  // Parse comma-separated "name[:qualifier]" entries, preserving order.
   llvm::SmallVector<llvm::StringRef, 8> entries;
   clauseVal.split(entries, ',', -1, false);
   bool ok = true;
@@ -288,6 +294,7 @@ private:
   }
 
   mlir::LogicalResult lowerStmt(clang::Stmt *stmt) {
+    // Only a small C subset is supported inside kernel blocks.
     if (!stmt) {
       return mlir::success();
     }
@@ -328,6 +335,7 @@ private:
   }
 
   mlir::LogicalResult lowerDecl(clang::DeclStmt *DS) {
+    // Local scalar/array declarations become stack memrefs.
     for (auto *decl : DS->decls()) {
       auto *VD = llvm::dyn_cast<clang::VarDecl>(decl);
       if (!VD) {
@@ -380,6 +388,7 @@ private:
   }
 
   mlir::LogicalResult lowerIf(clang::IfStmt *IS) {
+    // Lower if/else into scf.if with explicit yields.
     mlir::Value cond = lowerCondExpr(IS->getCond());
     if (!cond) {
       return mlir::failure();
@@ -422,6 +431,7 @@ private:
   }
 
   mlir::LogicalResult lowerFor(clang::ForStmt *FS) {
+    // Require canonical "for(i=lb; i<ub; ++i)" form.
     auto *init = FS->getInit();
     auto *cond = FS->getCond();
     auto *inc = FS->getInc();
@@ -487,6 +497,7 @@ private:
   }
 
   mlir::Value lowerCondExpr(clang::Expr *expr) {
+    // Conditions are limited to integer literals and comparisons.
     if (!expr) {
       return nullptr;
     }
@@ -560,6 +571,7 @@ private:
   }
 
   mlir::LogicalResult lowerAssign(clang::BinaryOperator *BO) {
+    // Support simple assignment and +=/-= into scalars/arrays.
     mlir::Location loc = builder.getUnknownLoc();
     auto opcode = BO->getOpcode();
     if (opcode != clang::BO_Assign && opcode != clang::BO_AddAssign &&
@@ -623,6 +635,7 @@ private:
   }
 
   mlir::Value lowerValueExpr(clang::Expr *expr) {
+    // Values are integer literals, decl refs, array loads, and +,-,*.
     if (!expr) {
       return nullptr;
     }
@@ -710,6 +723,7 @@ private:
   }
 
   mlir::Value lowerIndexExpr(clang::Expr *expr) {
+    // Indices are integer literals, decl refs, and +/- expressions.
     if (!expr) {
       return nullptr;
     }
@@ -772,6 +786,7 @@ private:
 
   bool lowerArraySubscript(clang::ArraySubscriptExpr *expr, mlir::Value &base,
                            llvm::SmallVectorImpl<mlir::Value> &indices) {
+    // Build base + index list from nested subscripts.
     llvm::SmallVector<clang::Expr *, 4> idxExprs;
     clang::Expr *cur = expr;
     while (auto *sub = llvm::dyn_cast<clang::ArraySubscriptExpr>(cur)) {
@@ -866,6 +881,7 @@ void lowerKernelsToMLIR(EventDB &localDb, clang::ASTContext &Ctx,
   if (localDb.kernels.empty()) {
     return;
   }
+  // Each kernel pragma block becomes one MLIR func with memref args.
   ensureKernelModule(outDb);
   clang::SourceManager &SM = Ctx.getSourceManager();
   const clang::LangOptions &LangOpts = Ctx.getLangOpts();
@@ -913,6 +929,7 @@ void lowerKernelsToMLIR(EventDB &localDb, clang::ASTContext &Ctx,
     unsigned inIndex = 0;
     unsigned outIndex = 0;
     bool portsValid = true;
+    // Parse "in(...)" and "out(...)" clauses into ordered ports.
     for (const auto &clause : kernel.begin.clauses) {
       if (clause.key == "in") {
         portsValid = parsePortClause(clause.val, true, inIndex, ports, portNames,
@@ -935,6 +952,7 @@ void lowerKernelsToMLIR(EventDB &localDb, clang::ASTContext &Ctx,
     llvm::SmallVector<mlir::Type, 8> argTypes;
     llvm::SmallVector<const clang::ParmVarDecl *, 8> argParams;
     llvm::StringMap<unsigned> argIndexByName;
+    // Only parameters referenced by ports become func arguments.
     for (const auto *param : finder.match.func->parameters()) {
       auto it = portByName.find(param->getName());
       if (it == portByName.end()) {
@@ -984,11 +1002,13 @@ void lowerKernelsToMLIR(EventDB &localDb, clang::ASTContext &Ctx,
 
     auto funcType = builder.getFunctionType(argTypes, {});
     auto func = builder.create<mlir::func::FuncOp>(loc, funcName, funcType);
+    // Attach pragma metadata for downstream glue/schedule passes.
     applyKernelAttrs(func.getOperation(), kernel, builder);
 
     if (!ports.empty()) {
       llvm::SmallVector<mlir::Attribute, 8> portMapAttrs;
       portMapAttrs.reserve(ports.size());
+      // Encode port order/qualifiers into neptunecc.port_map for glue.
       for (const auto &port : ports) {
         unsigned argIndex = argIndexByName[port.name];
         llvm::SmallString<64> mapping;
@@ -1011,6 +1031,7 @@ void lowerKernelsToMLIR(EventDB &localDb, clang::ASTContext &Ctx,
 
     auto *entry = func.addEntryBlock();
     KernelLowerer lowerer(Ctx, func, portNames);
+    // Bind function params to MLIR block arguments before lowering.
     for (unsigned idx = 0; idx < argParams.size(); ++idx) {
       lowerer.bindParam(argParams[idx], entry->getArgument(idx));
     }

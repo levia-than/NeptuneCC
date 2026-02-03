@@ -29,6 +29,7 @@ void NeptunePragmaHandler::HandlePragma(Preprocessor &PP,
                                         Token &FirstToken) {
   (void)Introducer;
 
+  // Only accept "kernel/halo/overlap" pragmas; ignore anything else.
   if (!FirstToken.is(clang::tok::identifier)) {
     consumeToEOD(PP);
     return;
@@ -46,6 +47,7 @@ void NeptunePragmaHandler::HandlePragma(Preprocessor &PP,
     return;
   }
 
+  // Expect begin/end after the pragma kind.
   Token KindTok;
   PP.Lex(KindTok);
   if (!KindTok.is(clang::tok::identifier) || !KindTok.getIdentifierInfo()) {
@@ -80,6 +82,7 @@ void NeptunePragmaHandler::HandlePragma(Preprocessor &PP,
   event.fileOffset = SM.getFileOffset(SM.getExpansionLoc(event.loc));
   event.filePath = SM.getFilename(SM.getExpansionLoc(event.loc));
 
+  // Parse key(value) clauses; tag/name are lifted to explicit fields.
   bool reachedEOD = false;
   while (!reachedEOD) {
     Token Tok;

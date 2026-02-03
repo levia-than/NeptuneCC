@@ -18,6 +18,7 @@ namespace neptune {
 
 static std::optional<llvm::StringRef>
 getClauseValue(const Event &event, llvm::StringRef key) {
+  // Helper for optional pragma clauses in manifest emission.
   for (const auto &clause : event.clauses) {
     if (clause.key == key)
       return llvm::StringRef(clause.val);
@@ -26,6 +27,7 @@ getClauseValue(const Event &event, llvm::StringRef key) {
 }
 
 static bool writeKernelsMLIR(const EventDB &db, llvm::StringRef outDir) {
+  // Emit MLIR for kernels; either from kernelModule or a stub module.
   llvm::SmallString<256> outputPath(outDir);
   llvm::sys::path::append(outputPath, "kernels.mlir");
 
@@ -128,6 +130,7 @@ bool writeManifest(const EventDB &db, llvm::StringRef outDir,
   llvm::json::Array kernels;
   llvm::json::Array haloBlocks;
   llvm::json::Array overlaps;
+  // Kernel entries carry tag/name/offsets and raw pragma clauses.
   for (const auto &kernel : db.kernels) {
     if (!kernel.blockBegin.isValid() || !kernel.blockEnd.isValid()) {
       continue;
@@ -155,6 +158,7 @@ bool writeManifest(const EventDB &db, llvm::StringRef outDir,
   }
 
   for (const auto &halo : db.halos) {
+    // Halo entries record begin/end offsets plus user-provided metadata.
     llvm::json::Object obj;
     obj["tag"] = halo.begin.tag;
     obj["file"] = halo.begin.filePath;
@@ -178,6 +182,7 @@ bool writeManifest(const EventDB &db, llvm::StringRef outDir,
   }
 
   for (const auto &ov : db.overlaps) {
+    // Overlap entries record tag/kernel/halo bindings and block offsets.
     llvm::json::Object obj;
     obj["tag"] = ov.begin.tag;
     obj["kernel_tag"] = ov.kernelTag;

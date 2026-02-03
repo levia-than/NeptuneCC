@@ -107,6 +107,7 @@ namespace {
 using namespace mlir::Neptune::NeptuneIR;
 
 static bool matchConstantIndex(Value v, int64_t &out) {
+  // Conservative evaluator for constant index expressions.
   if (auto cst = v.getDefiningOp<arith::ConstantOp>()) {
     if (!cst.getType().isIndex())
       return false;
@@ -145,6 +146,7 @@ static bool matchConstantIndex(Value v, int64_t &out) {
 }
 
 static bool matchIndex(Value idx, Value iv, int64_t &offset) {
+  // Accept iv, iv + c, iv - c only.
   if (idx == iv) {
     offset = 0;
     return true;
@@ -231,6 +233,7 @@ static bool isTrivialCopy3(Value storeValue, Value inputMemref,
 
 static bool matchLoadOffsets1(memref::LoadOp load, Value ivI,
                               OffsetKey1 &out) {
+  // 1D stencil: allow offsets in {-1,0,1}.
   if (load.getIndices().size() != 1)
     return false;
 
@@ -247,6 +250,7 @@ static bool matchLoadOffsets1(memref::LoadOp load, Value ivI,
 
 static bool matchLoadOffsets(memref::LoadOp load, Value ivI, Value ivJ,
                              OffsetKey &out) {
+  // 2D stencil: only axis neighbors (Manhattan distance 1).
   if (load.getIndices().size() != 2)
     return false;
 
@@ -268,6 +272,7 @@ static bool matchLoadOffsets(memref::LoadOp load, Value ivI, Value ivJ,
 
 static bool matchLoadOffsets3(memref::LoadOp load, Value ivK, Value ivJ,
                               Value ivI, OffsetKey3 &out) {
+  // 3D stencil: only axis neighbors (Manhattan distance 1).
   if (load.getIndices().size() != 3)
     return false;
 
@@ -291,6 +296,7 @@ static bool matchLoadOffsets3(memref::LoadOp load, Value ivK, Value ivJ,
 }
 
 struct StencilNestMatch {
+  // Matched 2D loop nest and its stencil access offsets.
   scf::ForOp outer;
   scf::ForOp inner;
   memref::StoreOp store;
@@ -306,6 +312,7 @@ struct StencilNestMatch {
 };
 
 struct StencilNestMatch1 {
+  // Matched 1D loop and its stencil access offsets.
   scf::ForOp loop;
   memref::StoreOp store;
   Value inputMemref;
@@ -318,6 +325,7 @@ struct StencilNestMatch1 {
 };
 
 struct StencilNestMatch3 {
+  // Matched 3D loop nest and its stencil access offsets.
   scf::ForOp outer;
   scf::ForOp middle;
   scf::ForOp inner;
@@ -339,6 +347,8 @@ static LogicalResult collectExpr1(Value v, Type elemTy, Value ivI,
                                   Value outputMemref, Value &inputMemref,
                                   DenseMap<Value, OffsetKey1> &loadOffsets,
                                   DenseSet<Value> &visited) {
+  // Collect a pure expression tree rooted at v; reject side effects and
+  // accesses to the output buffer.
   if (visited.contains(v))
     return success();
   visited.insert(v);
@@ -395,6 +405,7 @@ static LogicalResult collectExpr(Value v, Type elemTy, Value ivI, Value ivJ,
                                  Value outputMemref, Value &inputMemref,
                                  DenseMap<Value, OffsetKey> &loadOffsets,
                                  DenseSet<Value> &visited) {
+  // 2D expression collection with the same purity constraints as 1D.
   if (visited.contains(v))
     return success();
   visited.insert(v);
@@ -452,6 +463,7 @@ static LogicalResult collectExpr3(Value v, Type elemTy, Value ivK, Value ivJ,
                                   Value &inputMemref,
                                   DenseMap<Value, OffsetKey3> &loadOffsets,
                                   DenseSet<Value> &visited) {
+  // 3D expression collection with the same purity constraints as 1D.
   if (visited.contains(v))
     return success();
   visited.insert(v);
@@ -957,6 +969,7 @@ static FailureOr<Value> buildExpr3(
 }
 
 static LogicalResult rewriteStencil(StencilNestMatch match) {
+  // Rewrite 2D loop nest into wrap/load/apply/store; enforce bounds safety.
   auto inMemrefTy = dyn_cast<MemRefType>(match.inputMemref.getType());
   auto outMemrefTy = dyn_cast<MemRefType>(match.outputMemref.getType());
   if (!inMemrefTy || !outMemrefTy)
@@ -1031,6 +1044,7 @@ static LogicalResult rewriteStencil(StencilNestMatch match) {
 }
 
 static LogicalResult rewriteStencil1(StencilNestMatch1 match) {
+  // Rewrite 1D loop into wrap/load/apply/store; enforce bounds safety.
   auto inMemrefTy = dyn_cast<MemRefType>(match.inputMemref.getType());
   auto outMemrefTy = dyn_cast<MemRefType>(match.outputMemref.getType());
   if (!inMemrefTy || !outMemrefTy)
@@ -1100,6 +1114,7 @@ static LogicalResult rewriteStencil1(StencilNestMatch1 match) {
 }
 
 static LogicalResult rewriteStencil3(StencilNestMatch3 match) {
+  // Rewrite 3D loop nest into wrap/load/apply/store; enforce bounds safety.
   auto inMemrefTy = dyn_cast<MemRefType>(match.inputMemref.getType());
   auto outMemrefTy = dyn_cast<MemRefType>(match.outputMemref.getType());
   if (!inMemrefTy || !outMemrefTy)
@@ -1184,6 +1199,7 @@ struct SCFToNeptuneIRPass final
   void runOnOperation() override {
     func::FuncOp func = getOperation();
 
+    // Only consider outermost loops; inner loops are handled by the matchers.
     SmallVector<scf::ForOp, 4> candidates;
     func.walk([&](scf::ForOp forOp) {
       if (!forOp->getParentOfType<scf::ForOp>())
@@ -1191,6 +1207,7 @@ struct SCFToNeptuneIRPass final
     });
 
     for (scf::ForOp outer : candidates) {
+      // Prefer 3D, then 2D, then 1D to avoid partial matches.
       auto match3 = matchStencilNest3(outer);
       if (succeeded(match3)) {
         (void)rewriteStencil3(*match3);

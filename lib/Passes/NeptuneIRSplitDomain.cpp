@@ -34,6 +34,7 @@ static BoundsAttr shrinkToInterior(MLIRContext *ctx, BoundsAttr b, DenseI64Array
   auto ub = b.getUb();
   int64_t rank = (int64_t)lb.size();
 
+  // Interior bounds = [lb + r, ub - r); keep exclusivity of ub.
   llvm::SmallVector<int64_t, 4> nlb(rank), nub(rank);
   for (int64_t d = 0; d < rank; ++d) {
     nlb[d] = lb[d] + radius[d];
@@ -68,7 +69,8 @@ struct InteriorOnlyPattern : OpRewritePattern<ApplyOp> {
     }
 
     if (ib == bounds) return failure();
-    op.setBoundsAttr(ib); // 只改 op 上的 bounds，type 上 bounds 先不动（避免一口气改太多）
+    // Only rewrite apply's bounds attribute; keep type bounds stable for now.
+    op.setBoundsAttr(ib);
     return success();
   }
 };
@@ -84,7 +86,7 @@ struct NeptuneIRSplitDomainPass final
     MLIRContext *ctx = module.getContext();
 
     if (mode != "interior-only") {
-      // MVP：只支持 interior-only
+      // MVP: only interior-only mode is supported.
       return;
     }
 

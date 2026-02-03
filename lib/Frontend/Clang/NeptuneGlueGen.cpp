@@ -132,6 +132,7 @@ static void logKernelSummary(const KernelInfo &info, const PortInfo &shapePort,
 static void logOverlapInfo(const KernelInfo &info, llvm::raw_ostream &os);
 
 static bool computeOverlapRegions(KernelInfo &info) {
+  // Overlap is only enabled when we can prove a non-empty safe-interior.
   size_t rank = info.outMin.size();
   if (rank == 0 || rank != info.outExtent.size() ||
       rank != info.radius.size()) {
@@ -152,6 +153,7 @@ static bool computeOverlapRegions(KernelInfo &info) {
     ub.push_back(info.outMin[i] + info.outExtent[i]);
   }
 
+  // safe-interior = [lb + r, ub - r)
   llvm::SmallVector<int64_t, 4> safeLb;
   llvm::SmallVector<int64_t, 4> safeUb;
   safeLb.reserve(rank);
@@ -171,6 +173,7 @@ static bool computeOverlapRegions(KernelInfo &info) {
   info.overlapInteriorUb = safeUb;
 
   info.overlapFaces.clear();
+  // Partition boundary into fixed faces; these do not overlap the interior.
   if (rank == 1) {
     KernelInfo::RegionInfo lo;
     lo.suffix = "face_lo";
@@ -183,6 +186,7 @@ static bool computeOverlapRegions(KernelInfo &info) {
     info.overlapFaces.push_back(lo);
     info.overlapFaces.push_back(hi);
   } else if (rank == 2) {
+    // 2D faces: top/bottom (full j), left/right (interior i).
     const int64_t i0 = lb[0], i1 = ub[0];
     const int64_t j0 = lb[1], j1 = ub[1];
     const int64_t ri = info.radius[0];
@@ -208,6 +212,7 @@ static bool computeOverlapRegions(KernelInfo &info) {
     info.overlapFaces.push_back(left);
     info.overlapFaces.push_back(right);
   } else if (rank == 3) {
+    // 3D faces: z/y/x slabs with interior-only ranges on the other axes.
     const int64_t i0 = lb[0], i1 = ub[0];
     const int64_t j0 = lb[1], j1 = ub[1];
     const int64_t k0 = lb[2], k1 = ub[2];
@@ -332,6 +337,7 @@ static void addCopyPair(llvm::SmallVectorImpl<CopyPairInfo> &pairs,
 static bool collectCopyPairsFromLoopNest(
     mlir::scf::ForOp outer, llvm::SmallVectorImpl<CopyPairInfo> &pairs,
     std::string &reason) {
+  // Recognize residual copy loops: store(load(in[ivs])) -> out[ivs].
   auto func = outer->getParentOfType<mlir::func::FuncOp>();
   if (!func) {
     reason = "residual loop not inside func";
@@ -381,6 +387,7 @@ static bool collectCopyPairsFromLoopNest(
     bool sawStore = false;
     for (mlir::Operation &op : current.getBody()->without_terminator()) {
       if (auto load = llvm::dyn_cast<mlir::memref::LoadOp>(op)) {
+        // Only allow block-argument memrefs with iv-only indices.
         auto memref = stripMemrefCasts(load.getMemref());
         auto memrefTy = llvm::dyn_cast<mlir::MemRefType>(memref.getType());
         if (!memrefTy || memrefTy.getRank() != static_cast<int>(loops.size())) {
@@ -406,6 +413,7 @@ static bool collectCopyPairsFromLoopNest(
         continue;
       }
       if (auto store = llvm::dyn_cast<mlir::memref::StoreOp>(op)) {
+        // Store must directly use a load result and share iv-only indices.
         auto memref = stripMemrefCasts(store.getMemref());
         auto memrefTy = llvm::dyn_cast<mlir::MemRefType>(memref.getType());
         if (!memrefTy || memrefTy.getRank() != static_cast<int>(loops.size())) {
@@ -485,6 +493,7 @@ static bool isWithinResidualLoop(
 static void analyzeResidualCopyBoundary(
     mlir::func::FuncOp func, mlir::Neptune::NeptuneIR::ApplyOp apply,
     ApplyStencilInfo &info) {
+  // Residual SCF is only accepted when it is pure copy-boundary.
   llvm::SmallVector<mlir::scf::ForOp, 4> residualLoops;
   bool sawResidual = false;
   bool ok = true;
@@ -536,6 +545,7 @@ static void analyzeResidualCopyBoundary(
                     mlir::Neptune::NeptuneIR::StoreOp>(op)) {
         return;
       }
+      // Any other op outside apply/residual loops invalidates partial rewrite.
       if (llvm::isa<mlir::scf::ForOp, mlir::scf::IfOp>(op)) {
         sawResidual = true;
         ok = false;
@@ -571,6 +581,7 @@ static void analyzeResidualCopyBoundary(
 
 static std::optional<ApplyStencilInfo>
 inferStencilFromApply(mlir::ModuleOp module, mlir::func::FuncOp func) {
+  // Clone + run SCF->NeptuneIR on the clone to avoid mutating the source.
   mlir::ModuleOp clone = module.clone();
   auto clonedFunc =
       clone.lookupSymbol<mlir::func::FuncOp>(func.getSymName());
@@ -615,6 +626,7 @@ inferStencilFromApply(mlir::ModuleOp module, mlir::func::FuncOp func) {
     info.radius.assign(radius->begin(), radius->end());
     info.radiusSource = "attr";
   } else {
+    // Derive radius from access offsets if possible; otherwise default to 1.
     info.radius.assign(lb.size(), 0);
     bool ok = true;
     bool sawAccess = false;
@@ -646,6 +658,7 @@ inferStencilFromApply(mlir::ModuleOp module, mlir::func::FuncOp func) {
   }
 
   for (mlir::Value input : apply.getInputs()) {
+    // Inputs must be Wrap -> Load -> Apply, and refer to func arguments.
     auto load = input.getDefiningOp<mlir::Neptune::NeptuneIR::LoadOp>();
     if (!load)
       return std::nullopt;
@@ -693,6 +706,7 @@ static bool validateStencilBounds(llvm::ArrayRef<int64_t> outMin,
                                   llvm::ArrayRef<int64_t> radius,
                                   llvm::ArrayRef<int64_t> inShape,
                                   llvm::StringRef tag) {
+  // Ensure out box + radius does not exceed the input shape.
   if (outMin.size() != inShape.size() ||
       outExtent.size() != inShape.size() ||
       radius.size() != inShape.size()) {
@@ -1746,6 +1760,8 @@ static void emitPortTemplatesForRegion(CodeWriter &w, const KernelInfo &kernel,
   int64_t offsetElems = 0;
 
   if (port.isInput) {
+    // P0: align to outMin (mins=-outMin, host offset 0).
+    // P1: ghosted base (mins=-radius, host offset = outMin - radius).
     bool useGhosted = port.isGhosted && allowGhostedPolicy;
     const char *policy = useGhosted ? "P1" : "P0";
     for (size_t d = 0; d < rank; ++d) {
@@ -2448,6 +2464,7 @@ bool rewriteKernelSources(const EventDB &db, llvm::StringRef outDir) {
         continue;
       }
 
+      // Only allow: halo-begin statements, kernel block, halo-end statements.
       llvm::StringRef midGap =
           contentRef.slice(kernelEndLineEnd, haloEndLineStart);
       if (!whitespaceOnly(midGap)) {
@@ -2478,6 +2495,7 @@ bool rewriteKernelSources(const EventDB &db, llvm::StringRef outDir) {
       repl.start = ov->blockBeginOffset;
       repl.end = ov->blockEndOffset;
       llvm::raw_string_ostream rso(repl.text);
+      // Rewrite order: halo-begin stmts -> interior -> halo-end stmts -> faces.
       rso << indent << "{" << newline;
       rso << beginStatements;
       rso << indent << "  neptunecc::" << kinfo->tag << "_interior(";

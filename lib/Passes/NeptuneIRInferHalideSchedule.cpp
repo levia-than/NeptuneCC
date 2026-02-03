@@ -59,6 +59,7 @@ static double getEnvDouble(llvm::StringRef name, double defaultValue) {
 }
 
 static int64_t pickThreads() {
+  // Deterministic order: NEPTUNECC_THREADS > HL_NUM_THREADS > OMP_NUM_THREADS.
   int64_t threads = getEnvInt("NEPTUNECC_THREADS", 0);
   if (threads > 0)
     return threads;
@@ -72,6 +73,7 @@ static int64_t pickThreads() {
 }
 
 static int64_t pickVectorWidth(bool &fromEnv) {
+  // Vector width is user-controlled; default is scalar if not specified.
   int64_t vl = getEnvInt("NEPTUNECC_VECTOR_WIDTH", 0);
   if (vl > 0) {
     fromEnv = true;
@@ -114,6 +116,7 @@ static int64_t clampTile(int64_t cand, int64_t extent, int64_t vec) {
 static int64_t computeFootprint(int64_t elemBytes,
                                 llvm::ArrayRef<int64_t> tile,
                                 llvm::ArrayRef<int64_t> radius) {
+  // Approximate footprint: input halo + output tile.
   int64_t haloProd = 1;
   int64_t tileProd = 1;
   for (size_t i = 0, e = tile.size(); i < e; ++i) {
@@ -214,6 +217,7 @@ static bool inferScheduleForApply(func::FuncOp func, ApplyOp apply) {
     }
   }
 
+  // Prefer shape from input temp bounds; fall back to outExtent if missing.
   llvm::SmallVector<int64_t, 4> shape;
   if (!apply.getInputs().empty()) {
     if (auto tempTy = dyn_cast<TempType>(apply.getInputs().front().getType())) {
@@ -251,6 +255,7 @@ static bool inferScheduleForApply(func::FuncOp func, ApplyOp apply) {
   bool vectorDisabled = false;
   if (vec < 1)
     vec = 1;
+  // Do not vectorize if the fast extent is smaller than the vector width.
   if (extentFast < vec) {
     vec = 1;
     vectorDisabled = true;
@@ -265,6 +270,8 @@ static bool inferScheduleForApply(func::FuncOp func, ApplyOp apply) {
 
   if (rank == 1) {
     auto candidates = chooseTile1D(extentFast, vec);
+    // Pick the largest candidate that fits the cache footprint (or the best
+    // available one if none fit).
     for (int64_t tx : candidates) {
       if (tx < 1)
         continue;
@@ -287,6 +294,7 @@ static bool inferScheduleForApply(func::FuncOp func, ApplyOp apply) {
   } else if (rank == 2) {
     int64_t extentSlow = outExtent[rank - 2];
     auto candidates = chooseTile2D(extentFast, extentSlow, vec);
+    // Candidates are in (fast, slow) order; store as [y, x] tile.
     for (auto pair : candidates) {
       llvm::SmallVector<int64_t, 2> t = {pair.second, pair.first};
       int64_t footprint = computeFootprint(elemBytes, t, radius);
@@ -310,6 +318,7 @@ static bool inferScheduleForApply(func::FuncOp func, ApplyOp apply) {
     int64_t extentMid = outExtent[rank - 2];
     int64_t extentSlow = outExtent[rank - 3];
     auto candidates = chooseTile3D(extentFast, extentMid, extentSlow, vec);
+    // Candidates are in (fast, mid, slow) order; store as [z, y, x] tile.
     for (auto &cand : candidates) {
       llvm::SmallVector<int64_t, 3> t = {cand[2], cand[1], cand[0]};
       int64_t footprint = computeFootprint(elemBytes, t, radius);
@@ -347,6 +356,7 @@ static bool inferScheduleForApply(func::FuncOp func, ApplyOp apply) {
 
   llvm::StringRef parDim = "none";
   if (cfg.threads > 1) {
+    // Parallelize the slowest useful outer tile dimension.
     if (rank == 2) {
       int64_t extentY = outExtent[0];
       if (extentY >= tile[0] * 2)
@@ -365,6 +375,7 @@ static bool inferScheduleForApply(func::FuncOp func, ApplyOp apply) {
   llvm::StringRef unrollDim = "y";
   llvm::StringRef unrollReason = "";
   if (rank >= 2) {
+    // Only unroll the inner-y loop when it divides evenly.
     if (yTile < 2) {
       unrollReason = "yi<2";
     } else if (yTile % 2 != 0) {
@@ -394,6 +405,7 @@ static bool inferScheduleForApply(func::FuncOp func, ApplyOp apply) {
   }
 
   NamedAttrList scheduleAttrs;
+  // Persist schedule for the emitter; do not bake logic into EmitC.
   scheduleAttrs.set("split", DenseI64ArrayAttr::get(ctx, tile));
   scheduleAttrs.set("vec", IntegerAttr::get(IntegerType::get(ctx, 64), vec));
   scheduleAttrs.set("par_dim", StringAttr::get(ctx, parDim));

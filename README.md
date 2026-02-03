@@ -11,10 +11,14 @@
 # NeptuneCC stencil compiler
 
 NeptuneCC is an MLIR/LLVM toolchain for stencil kernels and structured grid
-computations. It ships the
-NeptuneIR dialect and passes, the `neptune-opt` driver, and the `neptune-cc`
-Clang frontend for `#pragma neptune`. Runtime integration is currently out of
-tree.
+computations. It provides the NeptuneIR dialect + passes, a `neptune-opt`
+driver, and the `neptune-cc` Clang frontend for `#pragma neptune`.
+
+Highlights:
+- Frontend extraction from C/C++ stencil loops into NeptuneIR.
+- Halide AOT emission with deterministic schedule inference.
+- Glue generation + source rewrite for kernel calls.
+- Overlap-aware regions (halo begin/end + interior/boundary faces).
 
 ## Build
 
@@ -40,6 +44,47 @@ Artifacts land under `build/`:
 The build script symlinks `compile_commands.json` to the repo root and runs
 `check-neptune` after installing the tools.
 
+## Quickstart
+```bash
+# Build the toolchain
+bash scripts/build.sh
+
+# Frontend: extract + emit Halide (outputs in --out-dir)
+./build/project-build/bin/neptune-cc test/case_test/case1/case1.cpp \
+  --out-dir /tmp/neptune_out
+
+# MLIR-only pipelines
+./build/project-build/bin/neptune-opt test/mlir_tests/smoke_emitC_for_apply.mlir \
+  --neptuneir-verify-forms --neptuneir-normalize-apply -o normalized.mlir
+```
+
+## Pragmas (quick reference)
+```cpp
+#pragma neptune kernel begin tag(k0) in(x:ghosted) out(y:owned)
+  { /* stencil loops */ }
+#pragma neptune kernel end tag(k0)
+
+#pragma neptune halo begin tag(h0) dm(da) field(x) kind(global_to_local_begin)
+  /* user communication begin */
+#pragma neptune halo end tag(h0) kind(global_to_local_end)
+
+#pragma neptune overlap begin tag(o0) halo(h0) kernel(k0) policy(auto)
+  { /* halo begin + kernel + halo end */ }
+#pragma neptune overlap end tag(o0)
+```
+
+## Output layout
+`neptune-cc --out-dir <out>` produces:
+- `out/manifest.json` (front-end events + offsets)
+- `out/kernels.mlir` (kernel module snapshot)
+- `out/halide/` (Halide generator + AOT headers/libs)
+- `out/glue/` (C++ glue: `neptunecc_kernels.*`)
+- `out/rewritten/` (rewritten C++ calling `neptunecc::k*`)
+
+## Testing
+- MLIR regression tests (lit): `ninja -C build/project-build check-neptune`
+- End-to-end cases: `make -C test/case_test/<case> compare`
+
 ## Project layout
 - `include/`: tablegen + public headers (dialect, passes, frontend, utils)
 - `lib/`: implementations of the dialect, passes, frontend, and pipeline
@@ -61,26 +106,5 @@ The build script symlinks `compile_commands.json` to the repo root and runs
 Note: some legacy inputs still use the `neptune_ir` namespace, while the
 newer syntax uses the `neptune` dialect (see `test/mlir_tests/smoke_emitC_for_apply.mlir`).
 
-## Basic usage
-```bash
-./build/project-build/bin/neptune-opt test/mlir_tests/smoke_emitC_for_apply.mlir \
-  --neptuneir-verify-forms --neptuneir-normalize-apply -o normalized.mlir
-
-./build/project-build/bin/neptune-opt test/mlir_tests/smoke_emitC_for_apply.mlir \
-  --neptuneir-emitc-halide -o emitc.mlir
-```
-
-The `neptuneir-to-llvm` pipeline is registered in `neptune-opt` for LLVM
-lowering experiments.
-
-For the Clang frontend:
-```bash
-./build/project-build/bin/neptune-cc test/case_test/case1/case1.cpp \
-  --out-dir /tmp/neptune_out
-
-# If compile_commands.json is not in the repo root:
-./build/project-build/bin/neptune-cc -p build/project-build \
-  test/case_test/case1/case1.cpp --out-dir /tmp/neptune_out
-```
-
-`neptune-cc` writes a `manifest.json` under the chosen output directory.
+## Docs
+See `docs/README.md` for a short index of pragmas, overlap, glue, and tuning.

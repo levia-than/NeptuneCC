@@ -120,6 +120,7 @@ struct ScheduleAttr {
 };
 
 static ScheduleAttr parseScheduleAttr(ApplyOp apply, size_t rank) {
+  // Decode schedule attrs produced by neptuneir-infer-halide-schedule.
   ScheduleAttr info;
   auto dict = apply->getAttrOfType<DictionaryAttr>("neptune.schedule");
   if (!dict)
@@ -158,6 +159,7 @@ struct ExprEmitter {
         halideVars(halideVars.begin(), halideVars.end()) {}
 
   FailureOr<Value> emit(Value v) {
+    // Emit Halide Expr from access + arith ops; memoize per SSA value.
     auto it = cache.find(v);
     if (it != cache.end())
       return it->second;
@@ -525,6 +527,7 @@ static LogicalResult emitOneKernel(OpBuilder &b, func::FuncOp func,
   {
     ScheduleAttr schedule = parseScheduleAttr(apply, rank);
     if (schedule.valid) {
+      // Schedule helpers encapsulate Halide split/reorder/vectorize/unroll.
       int64_t parDim = 0;
       if (schedule.parDim == "y")
         parDim = 1;
@@ -538,6 +541,7 @@ static LogicalResult emitOneKernel(OpBuilder &b, func::FuncOp func,
       llvm::SmallVector<Value, 6> args;
       args.push_back(outFunc);
       if (rank == 1) {
+        // 1D: split fast dim, optional vectorize/unroll/parallel.
         args.push_back(buildIntLiteral(b, loc, schedule.split[0]));
         args.push_back(buildIntLiteral(b, loc, schedule.vec));
         args.push_back(buildIntLiteral(b, loc, enableParallel));
@@ -546,6 +550,7 @@ static LogicalResult emitOneKernel(OpBuilder &b, func::FuncOp func,
         b.create<emitc::CallOpaqueOp>(loc, TypeRange{},
                                       "neptune_halide::schedule_1d", args);
       } else if (rank == 2) {
+        // 2D: split x/y, reorder, vectorize x, unroll y, optional parallel y.
         int64_t tx = schedule.split[1];
         int64_t ty = schedule.split[0];
         args.push_back(buildIntLiteral(b, loc, tx));
@@ -557,6 +562,7 @@ static LogicalResult emitOneKernel(OpBuilder &b, func::FuncOp func,
         b.create<emitc::CallOpaqueOp>(loc, TypeRange{},
                                       "neptune_halide::schedule_2d", args);
       } else if (rank == 3) {
+        // 3D: split x/y/z, vectorize x, unroll y, optional parallel z/y.
         int64_t tx = schedule.split[2];
         int64_t ty = schedule.split[1];
         int64_t tz = schedule.split[0];
