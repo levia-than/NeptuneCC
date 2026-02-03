@@ -1,3 +1,4 @@
+// Generate Halide glue and rewrite sources.
 #include "Frontend/Clang/NeptuneGlueGen.h"
 
 #include "Dialect/NeptuneIR/NeptuneIRAttrs.h"
@@ -1245,15 +1246,6 @@ static void ensureKernelInclude(std::string &content) {
   ensureIncludeLine(content, "#include \"neptunecc_kernels.h\"");
 }
 
-static llvm::StringRef getClauseValue(const Event &event,
-                                      llvm::StringRef key) {
-  for (const auto &clause : event.clauses) {
-    if (clause.key == key)
-      return clause.val;
-  }
-  return {};
-}
-
 static void logResidualDecision(const KernelInfo &info,
                                 llvm::raw_ostream &os) {
   if (info.hasResidualScf) {
@@ -1713,16 +1705,6 @@ static void emitDimsTemplateAndInit(CodeWriter &w, llvm::StringRef base,
   w.dedent();
   w.line("}");
   w.line();
-}
-
-static void emitDimsTemplateAndInit(CodeWriter &w, llvm::StringRef kernelTag,
-                                    llvm::StringRef prefix, unsigned roleIndex,
-                                    unsigned rank,
-                                    llvm::ArrayRef<DimSpec> dims,
-                                    int64_t offsetElems) {
-  std::string base =
-      llvm::formatv("{0}_{1}{2}", kernelTag, prefix, roleIndex).str();
-  emitDimsTemplateAndInit(w, base, rank, dims, offsetElems);
 }
 
 static std::string buildBaseName(const KernelInfo &kernel,

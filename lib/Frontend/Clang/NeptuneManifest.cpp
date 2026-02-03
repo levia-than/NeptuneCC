@@ -1,3 +1,4 @@
+// Emit manifest metadata from frontend events.
 #include "Frontend/Clang/NeptuneManifest.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"

@@ -1,3 +1,4 @@
+// Frontend MLIR generation interfaces.
 #pragma once
 
 #include "Frontend/Clang/NeptuneEvents.h"

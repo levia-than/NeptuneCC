@@ -1,3 +1,4 @@
+// NeptuneIR dialect declaration.
 #ifndef DIALECT_NEPTUNEIR_NEPTUNEDIALECT_H_
 #define DIALECT_NEPTUNEIR_NEPTUNEDIALECT_H_
 

@@ -1,3 +1,4 @@
+// Frontend event types for pragmas.
 #pragma once
 #include "clang/Basic/SourceLocation.h"
 #include "llvm/ADT/SmallString.h"

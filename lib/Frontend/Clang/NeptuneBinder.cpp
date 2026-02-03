@@ -1,3 +1,4 @@
+// Bind pragma events to source intervals.
 #include "Frontend/Clang/NeptuneBinder.h"
 
 #include "clang/AST/RecursiveASTVisitor.h"

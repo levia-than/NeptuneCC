@@ -1,3 +1,4 @@
+// Parse #pragma neptune clauses.
 #include "Frontend/Clang/NeptunePragma.h"
 
 #include "clang/Basic/IdentifierTable.h"

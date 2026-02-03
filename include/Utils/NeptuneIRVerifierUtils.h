@@ -1,3 +1,4 @@
+// NeptuneIR verifier utility declarations.
 #ifndef NEPTUNEIR_VERIFIER_UTILS_H
 #define NEPTUNEIR_VERIFIER_UTILS_H
 

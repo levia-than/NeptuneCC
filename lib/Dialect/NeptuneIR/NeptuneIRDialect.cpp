@@ -1,3 +1,4 @@
+// NeptuneIR dialect registration.
 //===- NeptuneIROps.cpp - NeptuneIR ops verifier implementations -------===//
 //
 // Verifier implementations for NeptuneIR ops.

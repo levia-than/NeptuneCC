@@ -1,3 +1,4 @@
+// Helpers for stable function name generation.
 #ifndef INCLUDE_UTILS_FUNCNAMEHELPER_H
 #define INCLUDE_UTILS_FUNCNAMEHELPER_H 
 

@@ -1,3 +1,4 @@
+// Infer deterministic Halide schedule from apply.
 #include "Dialect/NeptuneIR/NeptuneIRDialect.h"
 #include "Dialect/NeptuneIR/NeptuneIROps.h"
 #include "Passes/NeptuneIRPasses.h"

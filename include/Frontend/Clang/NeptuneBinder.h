@@ -1,3 +1,4 @@
+// Pragma binding data structures.
 #pragma once
 
 #include "Frontend/Clang/NeptuneEvents.h"

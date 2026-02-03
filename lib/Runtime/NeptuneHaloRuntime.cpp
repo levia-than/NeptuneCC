@@ -1,3 +1,4 @@
+// Default no-op halo runtime hooks.
 #include "Runtime/NeptuneHaloRuntime.h"
 
 #include "llvm/Support/Process.h"

@@ -1,3 +1,4 @@
+// Halo runtime hook API (overridable).
 #pragma once
 
 #if defined(__clang__) || defined(__GNUC__)

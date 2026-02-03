@@ -1,3 +1,4 @@
+// NeptuneIR attribute definitions.
 #ifndef NEPTUNEIR_NEPTUNEIRATTRS_H
 #define NEPTUNEIR_NEPTUNEIRATTRS_H
 

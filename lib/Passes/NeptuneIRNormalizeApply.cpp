@@ -1,3 +1,4 @@
+// Normalize neptune.ir.apply patterns.
 #include "Dialect/NeptuneIR/NeptuneIRAttrs.h"
 #include "Dialect/NeptuneIR/NeptuneIRDialect.h"
 #include "Dialect/NeptuneIR/NeptuneIROps.h"
@@ -25,7 +26,6 @@ using namespace mlir::Neptune::NeptuneIR;
 // 从 apply.body 里扫描所有 ir.access 的 offsets，推导每个维度的 max(|offset|)
 static DenseI64ArrayAttr inferRadiusFromAccess(ApplyOp apply) {
   auto *ctx = apply.getContext();
-  Block &b = apply.getBody().front();
 
   // rank: 用 bounds.lb 的长度做 rank（你现在的 BoundsAttr 就是 DenseI64ArrayAttr）
   auto bounds = apply.getBounds();

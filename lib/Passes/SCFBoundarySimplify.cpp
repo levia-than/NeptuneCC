@@ -1,3 +1,4 @@
+// Simplify boundary control flow for stencil loops.
 #include "Dialect/NeptuneIR/NeptuneIRDialect.h"
 #include "Passes/NeptuneIRPasses.h"
 
