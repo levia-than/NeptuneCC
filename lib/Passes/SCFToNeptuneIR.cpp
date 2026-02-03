@@ -1,4 +1,4 @@
-// Lower SCF stencil loops to NeptuneIR.
+// Matches stencil-like SCF loops and lowers them to NeptuneIR apply.
 #include "Dialect/NeptuneIR/NeptuneIRAttrs.h"
 #include "Dialect/NeptuneIR/NeptuneIRDialect.h"
 #include "Dialect/NeptuneIR/NeptuneIROps.h"

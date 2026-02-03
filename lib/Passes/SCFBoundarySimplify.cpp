@@ -28,6 +28,7 @@ namespace mlir::Neptune::NeptuneIR {
 namespace {
 using namespace mlir::Neptune::NeptuneIR;
 
+// Summary snapshot used for logging the decision and geometry.
 struct SummaryInfo {
   int64_t rank = 0;
   std::vector<int64_t> lb;
@@ -124,14 +125,17 @@ static std::string joinI64(const std::vector<int64_t> &vals) {
   return out;
 }
 
+// Centralized logger for this pass.
 static void logLine(const std::string &msg) {
   llvm::outs() << "[neptuneir-scf-boundary-simplify] " << msg << "\n";
 }
 
+// Kernel functions are identified by neptunecc.tag.
 static bool isKernelFunc(func::FuncOp func) {
   return func->hasAttr("neptunecc.tag");
 }
 
+// Checks that a value is invariant across a loop nest.
 static bool isLoopInvariantAcross(Value cond,
                                   const std::vector<scf::ForOp> &loops) {
   for (scf::ForOp loop : loops) {
@@ -141,6 +145,7 @@ static bool isLoopInvariantAcross(Value cond,
   return true;
 }
 
+// Scans a region and records stores; rejects side effects or unsupported ops.
 static bool collectStoresAndCheckRegion(Region &region,
                                         llvm::DenseSet<Value> &stores,
                                         std::string &reason) {
@@ -935,6 +940,7 @@ static bool collectBoundaryConds1D(Value cond, Value ivI, int64_t lbI,
   return false;
 }
 
+// Forward declaration for region cloning helper.
 static void cloneRegionOps(Region &src, OpBuilder &b, IRMapping &mapping);
 
 static scf::ForOp buildLoopWithBranch1D(OpBuilder &b, Location loc, Value lbI,
@@ -949,6 +955,7 @@ static scf::ForOp buildLoopWithBranch1D(OpBuilder &b, Location loc, Value lbI,
   return loop;
 }
 
+// Clones a region body into the current builder using a prebuilt value map.
 static void cloneRegionOps(Region &src, OpBuilder &b, IRMapping &mapping) {
   Block &block = src.front();
   for (Operation &op : block.without_terminator()) {
@@ -956,17 +963,20 @@ static void cloneRegionOps(Region &src, OpBuilder &b, IRMapping &mapping) {
   }
 }
 
+// Whitelist for predicate construction: keep conditions simple and local.
 static bool isCondDefOp(Operation *op) {
   return isa<arith::CmpIOp, arith::OrIOp, arith::AndIOp, arith::XOrIOp,
              arith::AddIOp, arith::SubIOp, arith::IndexCastOp,
              arith::ConstantOp, arith::ConstantIndexOp>(op);
 }
 
+// Whitelist for bound expressions: integer add/sub/cast/const only.
 static bool isBoundDefOp(Operation *op) {
   return isa<arith::AddIOp, arith::SubIOp, arith::IndexCastOp,
              arith::ConstantOp, arith::ConstantIndexOp>(op);
 }
 
+// Collects the def-use slice of a bound expression within a single block.
 static bool collectValueOps(Value v, Block &block,
                             llvm::DenseSet<Operation *> &ops,
                             std::string &reason) {
@@ -994,6 +1004,7 @@ static bool collectValueOps(Value v, Block &block,
   return true;
 }
 
+// Gathers ops that define loop bounds/step; rejects non-local math.
 static bool collectLoopBoundOps(scf::ForOp loop, Block &block,
                                 llvm::DenseSet<Operation *> &ops,
                                 std::string &reason) {
@@ -1006,6 +1017,7 @@ static bool collectLoopBoundOps(scf::ForOp loop, Block &block,
   return true;
 }
 
+// Collects the predicate tree; used to prove the if is the only side op.
 static bool collectCondOps(Value cond, Block &block,
                            llvm::DenseSet<Operation *> &condOps,
                            std::string &reason) {
@@ -1040,6 +1052,7 @@ static bool collectCondOps(Value cond, Block &block,
   return true;
 }
 
+// Builds a fresh 2D loop nest and splices in a branch with remapped IVs.
 static scf::ForOp buildLoopNestWithBranch(OpBuilder &b, Location loc,
                                           Value lbI, Value ubI, Value lbJ,
                                           Value ubJ, Value step,
@@ -1060,6 +1073,7 @@ static scf::ForOp buildLoopNestWithBranch(OpBuilder &b, Location loc,
   return outer;
 }
 
+// Builds a fresh 3D loop nest and splices in a branch with remapped IVs.
 static scf::ForOp buildLoopNestWithBranch3D(OpBuilder &b, Location loc,
                                             Value lbI, Value ubI, Value lbJ,
                                             Value ubJ, Value lbK, Value ubK,
@@ -1084,8 +1098,8 @@ static scf::ForOp buildLoopNestWithBranch3D(OpBuilder &b, Location loc,
   return outer;
 }
 
+// Peels a 3D boundary-guarded loop into six faces plus a clean interior.
 static bool tryPeel3D(func::FuncOp func, SummaryInfo &summary) {
-  // Match a simple 3D loop+if boundary pattern and peel into faces+interior.
   for (auto outer : func.getOps<scf::ForOp>()) {
     if (!outer.getResults().empty())
       continue;
@@ -1301,7 +1315,7 @@ static bool tryPeel3D(func::FuncOp func, SummaryInfo &summary) {
     Value lbKPlusR = b.create<arith::ConstantIndexOp>(loc, lbK + radius);
     Value ubKMinusR = b.create<arith::ConstantIndexOp>(loc, ubK - radius);
 
-    // K slabs (full I/J, thin K faces).
+    // Build K faces: full I/J with thin K slabs.
     buildLoopNestWithBranch3D(b, loc, lbIVal, ubIVal, lbJVal, ubJVal, lbKVal,
                               lbKPlusR, step, ifOp.getThenRegion(),
                               outer.getInductionVar(),
@@ -1312,7 +1326,7 @@ static bool tryPeel3D(func::FuncOp func, SummaryInfo &summary) {
                               outer.getInductionVar(),
                               middle.getInductionVar(),
                               inner.getInductionVar());
-    // J slabs (K interior).
+    // Build J faces: K interior, thin J slabs.
     buildLoopNestWithBranch3D(b, loc, lbIVal, ubIVal, lbJVal, lbJPlusR,
                               lbKPlusR, ubKMinusR, step, ifOp.getThenRegion(),
                               outer.getInductionVar(),
@@ -1323,7 +1337,7 @@ static bool tryPeel3D(func::FuncOp func, SummaryInfo &summary) {
                               outer.getInductionVar(),
                               middle.getInductionVar(),
                               inner.getInductionVar());
-    // I slabs (J/K interior).
+    // Build I faces: J/K interior, thin I slabs.
     buildLoopNestWithBranch3D(b, loc, lbIVal, lbIPlusR, lbJPlusR, ubJMinusR,
                               lbKPlusR, ubKMinusR, step, ifOp.getThenRegion(),
                               outer.getInductionVar(),
@@ -1334,7 +1348,7 @@ static bool tryPeel3D(func::FuncOp func, SummaryInfo &summary) {
                               outer.getInductionVar(),
                               middle.getInductionVar(),
                               inner.getInductionVar());
-    // Interior stencil (no boundary guards).
+    // Build interior: no boundary guards, radius peeled away.
     buildLoopNestWithBranch3D(b, loc, lbIPlusR, ubIMinusR, lbJPlusR, ubJMinusR,
                               lbKPlusR, ubKMinusR, step, ifOp.getElseRegion(),
                               outer.getInductionVar(),
@@ -1360,8 +1374,8 @@ static bool tryPeel3D(func::FuncOp func, SummaryInfo &summary) {
   return false;
 }
 
+// Peels a 2D boundary-guarded loop into strips plus a clean interior.
 static bool tryPeel(func::FuncOp func, SummaryInfo &summary) {
-  // 2D peel: boundary if into strips + interior.
   for (auto outer : func.getOps<scf::ForOp>()) {
     if (!outer.getResults().empty())
       continue;
@@ -1555,8 +1569,8 @@ static bool tryPeel(func::FuncOp func, SummaryInfo &summary) {
   return false;
 }
 
+// Peels a 1D boundary if into two endpoint loops plus interior.
 static bool tryPeel1D(func::FuncOp func, SummaryInfo &summary) {
-  // 1D peel: boundary if into two endpoints + interior.
   for (auto loop : func.getOps<scf::ForOp>()) {
     if (!loop.getResults().empty())
       continue;
@@ -1674,6 +1688,7 @@ static bool tryPeel1D(func::FuncOp func, SummaryInfo &summary) {
   return false;
 }
 
+// Rebuilds a loop body by replacing the if with one selected branch.
 static bool cloneLoopWithIfBranch(scf::ForOp loop, scf::IfOp ifOp,
                                   bool takeThen, OpBuilder &b) {
   if (!loop.getResults().empty())
@@ -1697,8 +1712,8 @@ static bool cloneLoopWithIfBranch(scf::ForOp loop, scf::IfOp ifOp,
   return true;
 }
 
+// Hoists a loop-invariant if outside the loop when side effects are safe.
 static bool tryUnswitch(func::FuncOp func, SummaryInfo &summary) {
-  // Unswitch only when condition is loop-invariant and side-effect safe.
   bool changed = false;
 
   std::vector<scf::IfOp> ifOps;
@@ -1813,6 +1828,7 @@ struct SCFBoundarySimplifyPass final
       return;
     }
 
+    // Prefer 3D/1D/2D peeling; fall back to unswitch when peeling fails.
     if (!tryPeel3D(func, summary)) {
       if (!tryPeel1D(func, summary)) {
         if (!tryPeel(func, summary)) {

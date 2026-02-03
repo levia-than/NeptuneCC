@@ -1,4 +1,4 @@
-// Bind pragma events to source intervals.
+// Binds pragma events to source intervals and AST blocks.
 #include "Frontend/Clang/NeptuneBinder.h"
 
 #include "clang/AST/RecursiveASTVisitor.h"
@@ -13,6 +13,7 @@
 
 namespace neptune {
 
+// Fetches a clause value by key from an event's parsed clause list.
 static llvm::StringRef getClauseValue(const Event &event,
                                       llvm::StringRef key) {
   for (const auto &clause : event.clauses) {
@@ -22,6 +23,7 @@ static llvm::StringRef getClauseValue(const Event &event,
   return {};
 }
 
+// Builds kernel begin/end intervals with tag-matched pairing.
 void pairKernels(EventDB &db, clang::DiagnosticsEngine &DE) {
   db.kernels.clear();
   llvm::sort(db.events, [](const Event &lhs, const Event &rhs) {
@@ -78,6 +80,7 @@ void pairKernels(EventDB &db, clang::DiagnosticsEngine &DE) {
   }
 }
 
+// Builds halo begin/end intervals with tag-matched pairing.
 void pairHalos(EventDB &db, clang::DiagnosticsEngine &DE) {
   db.halos.clear();
   llvm::sort(db.events, [](const Event &lhs, const Event &rhs) {
@@ -130,6 +133,7 @@ void pairHalos(EventDB &db, clang::DiagnosticsEngine &DE) {
   }
 }
 
+// Builds overlap intervals and validates kernel/halo references.
 void pairOverlaps(EventDB &db, clang::DiagnosticsEngine &DE) {
   db.overlaps.clear();
   llvm::sort(db.events, [](const Event &lhs, const Event &rhs) {
@@ -208,6 +212,7 @@ void pairOverlaps(EventDB &db, clang::DiagnosticsEngine &DE) {
 
 namespace {
 
+// Maps a compound statement to a [begin,end] file interval.
 struct BlockInfo {
   clang::SourceLocation beginLoc;
   clang::SourceLocation endLoc;
@@ -215,6 +220,7 @@ struct BlockInfo {
   unsigned endOffset = 0;
 };
 
+// Collects compound statements to anchor pragma blocks to AST nodes.
 class BlockCollector : public clang::RecursiveASTVisitor<BlockCollector> {
 public:
   BlockCollector(clang::SourceManager &SM, const clang::LangOptions &LangOpts,
@@ -251,6 +257,7 @@ private:
 
 } // namespace
 
+// Binds kernel intervals to their enclosing compound statements.
 void bindKernelsToBlocks(EventDB &db, clang::ASTContext &Ctx) {
   clang::SourceManager &SM = Ctx.getSourceManager();
   const clang::LangOptions &LangOpts = Ctx.getLangOpts();
@@ -297,6 +304,7 @@ void bindKernelsToBlocks(EventDB &db, clang::ASTContext &Ctx) {
   }
 }
 
+// Binds overlap intervals to their enclosing compound statements.
 void bindOverlapsToBlocks(EventDB &db, clang::ASTContext &Ctx) {
   clang::SourceManager &SM = Ctx.getSourceManager();
   const clang::LangOptions &LangOpts = Ctx.getLangOpts();

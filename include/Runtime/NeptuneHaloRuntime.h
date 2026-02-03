@@ -25,3 +25,4 @@ NEPTUNECC_WEAK void halo_end(const char *tag, NeptuneDMHandle dm,
                              HaloToken tok);
 
 } // namespace neptunecc
+// Declares halo begin/end hooks used by overlap rewrites.

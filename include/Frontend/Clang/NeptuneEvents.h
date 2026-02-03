@@ -70,3 +70,4 @@ struct EventDB {
 };
 
 } // namespace neptune
+// Defines event records for pragma blocks and rewrite mapping.

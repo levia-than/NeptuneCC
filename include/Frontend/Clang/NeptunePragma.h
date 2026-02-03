@@ -28,3 +28,4 @@ void registerNeptunePragmas(clang::Preprocessor &PP, EventDB &db,
                             clang::SourceManager &SM);
 
 } // namespace neptune
+// Declares pragma parsing structures for Neptune kernel/halo/overlap tags.

@@ -13,3 +13,4 @@ void lowerKernelsToMLIR(EventDB &localDb, clang::ASTContext &Ctx,
                         EventDB &outDb);
 
 } // namespace neptune
+// Declares MLIR lowering entry points for Neptune kernel extraction.

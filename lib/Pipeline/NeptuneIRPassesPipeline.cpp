@@ -1,4 +1,5 @@
 // Pass pipeline registration for NeptuneIR.
+// Wires NeptuneIR passes into standard pipeline entry points.
 #include "Passes/NeptuneIRPassesPipeline.h"
 
 using namespace mlir;

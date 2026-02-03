@@ -1,4 +1,4 @@
-// Parse #pragma neptune clauses.
+// Parses #pragma neptune directives into structured events.
 #include "Frontend/Clang/NeptunePragma.h"
 
 #include "clang/Basic/IdentifierTable.h"
@@ -17,6 +17,7 @@ namespace neptune {
 NeptunePragmaHandler::NeptunePragmaHandler(EventDB &db, SourceManager &SM)
     : clang::PragmaHandler("kernel"), db(db), SM(SM) {}
 
+// Discards tokens until end-of-directive to keep the preprocessor in sync.
 static void consumeToEOD(Preprocessor &PP) {
   Token Tok;
   do {

@@ -10,3 +10,4 @@ bool writeManifest(const EventDB &db, llvm::StringRef outDir,
                    bool emitKernelsMLIR = false);
 
 } // namespace neptune
+// Declares manifest structures for emitted kernel metadata.

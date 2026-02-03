@@ -8,3 +8,4 @@
 #include "Dialect/NeptuneIR/NeptuneIROpsDialect.h.inc"
 
 #endif
+// Declares the NeptuneIR dialect.

@@ -1,4 +1,4 @@
-// Generate Halide glue and rewrite sources.
+// Emits Halide glue, performs kernel rewrite decisions, and logs strategy.
 #include "Frontend/Clang/NeptuneGlueGen.h"
 
 #include "Dialect/NeptuneIR/NeptuneIRAttrs.h"
@@ -19,6 +19,7 @@
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/FormatVariadic.h"
+#include "llvm/Support/JSON.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
@@ -67,6 +68,41 @@ struct ScheduleInfo {
   llvm::SmallVector<std::string, 8> reorder;
 };
 
+struct OverlapStrategyInfo {
+  bool valid = false;
+  std::string mode;
+  std::string reason;
+  bool forced = false;
+  bool radiusDefaulted = false;
+  int64_t rank = 0;
+  llvm::SmallVector<int64_t, 4> shape;
+  llvm::SmallVector<int64_t, 4> outMin;
+  llvm::SmallVector<int64_t, 4> outExtent;
+  llvm::SmallVector<int64_t, 4> radius;
+  int64_t elemBytes = 0;
+  int64_t stencilPoints = 0;
+  int64_t flopsPerPoint = 0;
+  int64_t bytesPerPoint = 0;
+  int64_t outVolume = 0;
+  int64_t boundaryVolume = 0;
+  int64_t haloFields = 0;
+  int64_t haloBytes = 0;
+  double peak = 0.0;
+  double bwMem = 0.0;
+  double bwNet = 0.0;
+  double netLat = 0.0;
+  double tInt = 0.0;
+  double tBnd = 0.0;
+  double tComm = 0.0;
+  double tOver = 0.0;
+  double tNo = 0.0;
+  double tOv = 0.0;
+  double gain = 0.0;
+  int64_t minPoints = 0;
+  int64_t callOverheadNs = 0;
+  double splitOverhead = 0.0;
+};
+
 struct KernelInfo {
   std::string tag;
   llvm::SmallVector<PortInfo, 8> ports;
@@ -87,6 +123,7 @@ struct KernelInfo {
   std::string radiusSource;
   std::string boundsSource;
   ScheduleInfo schedule;
+  OverlapStrategyInfo strategy;
   bool overlapSupported = false;
   std::string overlapReason;
   llvm::SmallVector<int64_t, 4> overlapInteriorLb;
@@ -111,6 +148,7 @@ struct KernelDecisionInfo {
   std::string boundaryCopyMode;
   bool overlapCovered = false;
   bool overlapRewritten = false;
+  std::string overlapSkipReason;
 };
 
 struct CodeWriter {
@@ -149,6 +187,7 @@ struct ApplyStencilInfo {
   llvm::SmallVector<int64_t, 4> radius;
   std::string radiusSource;
   ScheduleInfo schedule;
+  OverlapStrategyInfo strategy;
   llvm::SmallVector<unsigned, 4> applyInputArgs;
   std::optional<unsigned> applyOutputArg;
   bool hasResidualScf = false;
@@ -162,6 +201,7 @@ static void logResidualDecision(const KernelInfo &info,
 static void logKernelSummary(const KernelInfo &info, const PortInfo &shapePort,
                              llvm::raw_ostream &os);
 static void logOverlapInfo(const KernelInfo &info, llvm::raw_ostream &os);
+static void logStrategyInfo(const KernelInfo &info, llvm::raw_ostream &os);
 
 static bool computeOverlapRegions(KernelInfo &info) {
   // Overlap is only enabled when we can prove a non-empty safe-interior.
@@ -341,6 +381,98 @@ static ScheduleInfo parseScheduleAttr(mlir::DictionaryAttr dict, size_t rank) {
       info.reorder.push_back(strAttr.getValue().str());
     }
   }
+
+  info.valid = true;
+  return info;
+}
+
+static OverlapStrategyInfo
+parseOverlapStrategyAttr(mlir::DictionaryAttr dict) {
+  OverlapStrategyInfo info;
+  if (!dict)
+    return info;
+
+  if (auto modeAttr = dict.getAs<mlir::StringAttr>("mode"))
+    info.mode = modeAttr.getValue().str();
+  if (auto reasonAttr = dict.getAs<mlir::StringAttr>("reason"))
+    info.reason = reasonAttr.getValue().str();
+  if (auto forcedAttr = dict.getAs<mlir::BoolAttr>("forced"))
+    info.forced = forcedAttr.getValue();
+
+  auto modelAttr = dict.getAs<mlir::DictionaryAttr>("model");
+  if (!modelAttr) {
+    info.valid = true;
+    return info;
+  }
+
+  if (auto rankAttr = modelAttr.getAs<mlir::IntegerAttr>("rank"))
+    info.rank = rankAttr.getInt();
+  if (auto shapeAttr = modelAttr.getAs<mlir::DenseI64ArrayAttr>("shape")) {
+    auto vals = shapeAttr.asArrayRef();
+    info.shape.assign(vals.begin(), vals.end());
+  }
+  if (auto outMinAttr = modelAttr.getAs<mlir::DenseI64ArrayAttr>("out_min")) {
+    auto vals = outMinAttr.asArrayRef();
+    info.outMin.assign(vals.begin(), vals.end());
+  }
+  if (auto outExtentAttr =
+          modelAttr.getAs<mlir::DenseI64ArrayAttr>("out_extent")) {
+    auto vals = outExtentAttr.asArrayRef();
+    info.outExtent.assign(vals.begin(), vals.end());
+  }
+  if (auto radiusAttr = modelAttr.getAs<mlir::DenseI64ArrayAttr>("radius")) {
+    auto vals = radiusAttr.asArrayRef();
+    info.radius.assign(vals.begin(), vals.end());
+  }
+  if (auto radiusDefaultedAttr =
+          modelAttr.getAs<mlir::BoolAttr>("radius_defaulted"))
+    info.radiusDefaulted = radiusDefaultedAttr.getValue();
+  if (auto elemAttr = modelAttr.getAs<mlir::IntegerAttr>("elem_bytes"))
+    info.elemBytes = elemAttr.getInt();
+  if (auto spAttr = modelAttr.getAs<mlir::IntegerAttr>("stencil_points"))
+    info.stencilPoints = spAttr.getInt();
+  if (auto flopsAttr = modelAttr.getAs<mlir::IntegerAttr>("flops_per_point"))
+    info.flopsPerPoint = flopsAttr.getInt();
+  if (auto bytesAttr = modelAttr.getAs<mlir::IntegerAttr>("bytes_per_point"))
+    info.bytesPerPoint = bytesAttr.getInt();
+  if (auto outVolAttr = modelAttr.getAs<mlir::IntegerAttr>("out_volume"))
+    info.outVolume = outVolAttr.getInt();
+  if (auto bndVolAttr = modelAttr.getAs<mlir::IntegerAttr>("boundary_volume"))
+    info.boundaryVolume = bndVolAttr.getInt();
+  if (auto fieldsAttr = modelAttr.getAs<mlir::IntegerAttr>("halo_fields"))
+    info.haloFields = fieldsAttr.getInt();
+  if (auto bytesAttr = modelAttr.getAs<mlir::IntegerAttr>("halo_bytes"))
+    info.haloBytes = bytesAttr.getInt();
+  if (auto peakAttr = modelAttr.getAs<mlir::FloatAttr>("peak"))
+    info.peak = peakAttr.getValueAsDouble();
+  if (auto bwAttr = modelAttr.getAs<mlir::FloatAttr>("bw_mem"))
+    info.bwMem = bwAttr.getValueAsDouble();
+  if (auto bwAttr = modelAttr.getAs<mlir::FloatAttr>("bw_net"))
+    info.bwNet = bwAttr.getValueAsDouble();
+  if (auto latAttr = modelAttr.getAs<mlir::FloatAttr>("net_lat"))
+    info.netLat = latAttr.getValueAsDouble();
+  if (auto tAttr = modelAttr.getAs<mlir::FloatAttr>("t_int"))
+    info.tInt = tAttr.getValueAsDouble();
+  if (auto tAttr = modelAttr.getAs<mlir::FloatAttr>("t_bnd"))
+    info.tBnd = tAttr.getValueAsDouble();
+  if (auto tAttr = modelAttr.getAs<mlir::FloatAttr>("t_comm"))
+    info.tComm = tAttr.getValueAsDouble();
+  if (auto tAttr = modelAttr.getAs<mlir::FloatAttr>("t_overhead"))
+    info.tOver = tAttr.getValueAsDouble();
+  if (auto tAttr = modelAttr.getAs<mlir::FloatAttr>("t_no"))
+    info.tNo = tAttr.getValueAsDouble();
+  if (auto tAttr = modelAttr.getAs<mlir::FloatAttr>("t_ov"))
+    info.tOv = tAttr.getValueAsDouble();
+  if (auto gainAttr = modelAttr.getAs<mlir::FloatAttr>("gain"))
+    info.gain = gainAttr.getValueAsDouble();
+  if (auto minAttr = modelAttr.getAs<mlir::IntegerAttr>("min_points"))
+    info.minPoints = minAttr.getInt();
+  if (auto callAttr =
+          modelAttr.getAs<mlir::IntegerAttr>("call_overhead_ns"))
+    info.callOverheadNs = callAttr.getInt();
+  if (auto splitAttr =
+          modelAttr.getAs<mlir::FloatAttr>("split_overhead_per_elem"))
+    info.splitOverhead = splitAttr.getValueAsDouble();
 
   info.valid = true;
   return info;
@@ -685,6 +817,8 @@ inferStencilFromApply(mlir::ModuleOp module, mlir::func::FuncOp func) {
       mlir::Neptune::NeptuneIR::createSCFToNeptuneIRPass());
   pm.addNestedPass<mlir::func::FuncOp>(
       mlir::Neptune::NeptuneIR::createNeptuneIRInferHalideSchedulePass());
+  pm.addNestedPass<mlir::func::FuncOp>(
+      mlir::Neptune::NeptuneIR::createNeptuneIRInferOverlapStrategyPass());
   if (mlir::failed(pm.run(clone))) {
     return std::nullopt;
   }
@@ -790,6 +924,11 @@ inferStencilFromApply(mlir::ModuleOp module, mlir::func::FuncOp func) {
   if (auto schedAttr =
           apply->getAttrOfType<mlir::DictionaryAttr>("neptune.schedule")) {
     info.schedule = parseScheduleAttr(schedAttr, info.lb.size());
+  }
+  if (auto strategyAttr =
+          clonedFunc->getAttrOfType<mlir::DictionaryAttr>(
+              "neptune.strategy.overlap")) {
+    info.strategy = parseOverlapStrategyAttr(strategyAttr);
   }
 
   analyzeResidualCopyBoundary(clonedFunc, apply, info);
@@ -940,6 +1079,10 @@ static const PortInfo *pickShapePort(const KernelInfo &info) {
   return nullptr;
 }
 
+static bool strategyAllowsOverlap(const KernelInfo &info) {
+  return info.strategy.valid && info.strategy.mode == "overlap_split";
+}
+
 static bool isHalideArg(const KernelInfo &info, unsigned argIndex) {
   for (unsigned arg : info.halideArgs) {
     if (arg == argIndex) {
@@ -1041,6 +1184,7 @@ static bool collectKernelInfos(const EventDB &db,
     auto applyInfo = inferStencilFromApply(module, func);
     if (applyInfo) {
       info.schedule = applyInfo->schedule;
+      info.strategy = applyInfo->strategy;
     }
     if (applyInfo && applyInfo->applyOutputArg &&
         !applyInfo->applyInputArgs.empty()) {
@@ -1453,6 +1597,24 @@ static void logOverlapInfo(const KernelInfo &info, llvm::raw_ostream &os) {
   }
 }
 
+static void logStrategyInfo(const KernelInfo &info, llvm::raw_ostream &os) {
+  if (!info.strategy.valid) {
+    os << "neptune-cc:   strategy=<missing>\n";
+    return;
+  }
+  os << "neptune-cc:   strategy=" << info.strategy.mode;
+  if (info.strategy.forced)
+    os << " forced";
+  if (!info.strategy.reason.empty())
+    os << " reason=" << info.strategy.reason;
+  os << "\n";
+  os << "neptune-cc:   model Peak=" << info.strategy.peak
+     << " BW_mem=" << info.strategy.bwMem
+     << " BW_net=" << info.strategy.bwNet
+     << " Lat=" << info.strategy.netLat
+     << " Gain=" << info.strategy.gain << "\n";
+}
+
 static ScheduleDecision buildScheduleDecision(const ScheduleInfo &info) {
   ScheduleDecision out;
   out.valid = info.valid;
@@ -1486,6 +1648,8 @@ static OverlapPlan buildOverlapPlan(const KernelInfo &info,
     plan.reason = info.overlapReason;
   } else if (plan.enabled) {
     plan.reason = "";
+  } else if (decision.overlapCovered && !decision.overlapSkipReason.empty()) {
+    plan.reason = decision.overlapSkipReason;
   } else if (decision.overlapCovered && !decision.reason.empty()) {
     plan.reason = decision.reason;
   } else if (decision.overlapCovered) {
@@ -1558,6 +1722,98 @@ static void emitScheduleDebug(llvm::StringRef outDir,
     emitter.recordKernel(buildScheduleRecord(kernel, decision));
   }
   (void)emitter.flush();
+}
+
+static llvm::json::Array toJsonArray(llvm::ArrayRef<int64_t> vals) {
+  llvm::json::Array out;
+  out.reserve(vals.size());
+  for (int64_t v : vals) {
+    out.push_back(v);
+  }
+  return out;
+}
+
+static void emitStrategyReport(llvm::StringRef outDir,
+                               llvm::ArrayRef<KernelInfo> kernels) {
+  std::string path = joinPath(outDir, {"strategy.json"});
+  std::error_code ec;
+  llvm::raw_fd_ostream os(path, ec, llvm::sys::fs::OF_Text);
+  if (ec) {
+    llvm::errs() << "neptune-cc: failed to write strategy.json: "
+                 << ec.message() << "\n";
+    return;
+  }
+
+  llvm::SmallVector<const KernelInfo *, 8> sorted;
+  sorted.reserve(kernels.size());
+  for (const auto &kernel : kernels) {
+    sorted.push_back(&kernel);
+  }
+  std::sort(sorted.begin(), sorted.end(),
+            [](const KernelInfo *a, const KernelInfo *b) {
+              return a->tag < b->tag;
+            });
+
+  llvm::json::Array entries;
+  for (const KernelInfo *kernelPtr : sorted) {
+    const KernelInfo &kernel = *kernelPtr;
+    llvm::json::Object obj;
+    obj["kernel"] = kernel.tag;
+    obj["name"] = kernel.tag;
+    if (const PortInfo *shapePort = pickShapePort(kernel)) {
+      obj["rank"] = static_cast<int64_t>(shapePort->rank);
+      obj["shape"] = toJsonArray(shapePort->shape);
+    }
+
+    const OverlapStrategyInfo &s = kernel.strategy;
+    llvm::json::Object strat;
+    if (s.valid) {
+      strat["mode"] = s.mode;
+      strat["reason"] = s.reason;
+      strat["forced"] = s.forced;
+      llvm::json::Object model;
+      model["rank"] = s.rank;
+      model["shape"] = toJsonArray(s.shape);
+      model["out_min"] = toJsonArray(s.outMin);
+      model["out_extent"] = toJsonArray(s.outExtent);
+      model["radius"] = toJsonArray(s.radius);
+      model["radius_defaulted"] = s.radiusDefaulted;
+      model["elem_bytes"] = s.elemBytes;
+      model["stencil_points"] = s.stencilPoints;
+      model["flops_per_point"] = s.flopsPerPoint;
+      model["bytes_per_point"] = s.bytesPerPoint;
+      model["out_volume"] = s.outVolume;
+      model["boundary_volume"] = s.boundaryVolume;
+      model["halo_fields"] = s.haloFields;
+      model["halo_bytes"] = s.haloBytes;
+      model["peak"] = s.peak;
+      model["bw_mem"] = s.bwMem;
+      model["bw_net"] = s.bwNet;
+      model["net_lat"] = s.netLat;
+      model["t_int"] = s.tInt;
+      model["t_bnd"] = s.tBnd;
+      model["t_comm"] = s.tComm;
+      model["t_overhead"] = s.tOver;
+      model["t_no"] = s.tNo;
+      model["t_ov"] = s.tOv;
+      model["gain"] = s.gain;
+      model["min_points"] = s.minPoints;
+      model["call_overhead_ns"] = s.callOverheadNs;
+      model["split_overhead_per_elem"] = s.splitOverhead;
+      strat["model"] = std::move(model);
+    } else {
+      strat["mode"] = "unknown";
+      strat["reason"] = "missing";
+      strat["forced"] = false;
+    }
+    obj["strategy"] = std::move(strat);
+    entries.push_back(std::move(obj));
+  }
+
+  llvm::json::Object root;
+  root["version"] = 1;
+  root["kernels"] = std::move(entries);
+  os << llvm::json::Value(std::move(root)) << "\n";
 }
 
 static void emitKernelSignatureWithName(llvm::raw_ostream &os,
@@ -2103,6 +2359,7 @@ static bool writeGlueCpp(llvm::StringRef glueDir,
     logKernelSummary(kernel, *inPort, llvm::outs());
     logResidualDecision(kernel, llvm::outs());
     logOverlapInfo(kernel, llvm::outs());
+    logStrategyInfo(kernel, llvm::outs());
 
     for (const auto &port : kernel.ports) {
       if (!isHalideArg(kernel, port.argIndex)) {
@@ -2525,15 +2782,12 @@ bool rewriteKernelSources(const EventDB &db, llvm::StringRef outDir) {
 
   llvm::StringMap<llvm::SmallVector<const OverlapInterval *, 4>>
       overlapsByFile;
-  llvm::StringMap<bool> overlapCoverage;
   for (const auto &ov : db.overlaps) {
     if (!ov.blockBegin.isValid() || !ov.blockEnd.isValid())
       continue;
     if (ov.begin.filePath.empty())
       continue;
     overlapsByFile[ov.begin.filePath].push_back(&ov);
-    if (!ov.kernelTag.empty())
-      overlapCoverage[ov.kernelTag] = true;
   }
   for (const auto &kernel : db.kernels) {
     if (!kernel.blockBegin.isValid() || !kernel.blockEnd.isValid()) {
@@ -2588,7 +2842,9 @@ bool rewriteKernelSources(const EventDB &db, llvm::StringRef outDir) {
         }
       }
     }
-    if (coveredByOverlap) {
+    bool useOverlapRewrite =
+        coveredByOverlap && strategyAllowsOverlap(*it->second);
+    if (useOverlapRewrite) {
       auto decIt = decisions.find(tag);
       if (decIt != decisions.end()) {
         decIt->second.overlapCovered = true;
@@ -2665,12 +2921,13 @@ bool rewriteKernelSources(const EventDB &db, llvm::StringRef outDir) {
       return;
     KernelDecisionInfo &dec = it->second;
     dec.overlapCovered = true;
+    dec.overlapSkipReason = reason.str();
     if (dec.overlapRewritten)
       return;
-    if (dec.mode == "SkipRewrite" && !dec.reason.empty())
-      return;
-    dec.mode = "SkipRewrite";
-    dec.reason = std::string("overlap_skip: ") + reason.str();
+    if (dec.mode == "OverlapRewrite") {
+      dec.mode = "SkipRewrite";
+      dec.reason = std::string("overlap_skip: ") + reason.str();
+    }
   };
 
   auto markOverlapSuccess = [&](llvm::StringRef kernelTag) {
@@ -2682,6 +2939,7 @@ bool rewriteKernelSources(const EventDB &db, llvm::StringRef outDir) {
     dec.overlapRewritten = true;
     dec.mode = "OverlapRewrite";
     dec.reason.clear();
+    dec.overlapSkipReason.clear();
   };
 
   for (auto &entry : overlapsByFile) {
@@ -2718,6 +2976,17 @@ bool rewriteKernelSources(const EventDB &db, llvm::StringRef outDir) {
         continue;
       }
       const KernelInfo *kinfo = kInfoIt->second;
+      if (!strategyAllowsOverlap(*kinfo)) {
+        std::string reason = "strategy no_overlap";
+        if (kinfo->strategy.valid && !kinfo->strategy.reason.empty()) {
+          reason += ": ";
+          reason += kinfo->strategy.reason;
+        }
+        llvm::errs() << "neptune-cc: skip overlap rewrite for tag '"
+                     << ov->begin.tag << "' (" << reason << ")\n";
+        markOverlapSkip(ov->kernelTag, reason);
+        continue;
+      }
       if (!kinfo->boundsValid || !kinfo->overlapSupported) {
         llvm::errs() << "neptune-cc: skip overlap rewrite for tag '"
                      << ov->begin.tag << "' ("
@@ -2835,6 +3104,7 @@ bool rewriteKernelSources(const EventDB &db, llvm::StringRef outDir) {
   }
 
   emitScheduleDebug(outDir, kernels, decisions);
+  emitStrategyReport(outDir, kernels);
   if (filesToRewrite.empty()) {
     return true;
   }

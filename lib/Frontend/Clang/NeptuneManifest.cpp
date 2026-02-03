@@ -1,4 +1,4 @@
-// Emit manifest metadata from frontend events.
+// Serializes kernel/pragma metadata into the manifest JSON.
 #include "Frontend/Clang/NeptuneManifest.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"

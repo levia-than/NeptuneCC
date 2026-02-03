@@ -1,4 +1,4 @@
-// NeptuneIR form verification pass.
+// Verifies NeptuneIR structural invariants for apply/load/store.
 #include "Dialect/NeptuneIR/NeptuneIRAttrs.h"
 #include "Dialect/NeptuneIR/NeptuneIRDialect.h"
 #include "Dialect/NeptuneIR/NeptuneIROps.h"
@@ -23,6 +23,7 @@ namespace mlir::Neptune::NeptuneIR {
 namespace {
 using namespace mlir::Neptune::NeptuneIR;
 
+// Extracts rank from bounds, rejecting malformed lb/ub.
 static int64_t getRankFromBounds(BoundsAttr b) {
   if (!b) return -1;
   auto lb = b.getLb();
@@ -31,13 +32,14 @@ static int64_t getRankFromBounds(BoundsAttr b) {
   return (int64_t)lb.size();
 }
 
+// Checks apply for rank/radius/offset consistency and yield typing.
 static LogicalResult verifyApply(ApplyOp op) {
   auto bounds = op.getBounds();
   auto rank = getRankFromBounds(bounds);
   if (rank <= 0)
     return op.emitOpError("invalid bounds: lb/ub length mismatch or empty");
 
-  // radius 必须存在（你说了现在是 array<i64:...>，也就是 DenseI64ArrayAttr）
+  // Radius is mandatory; use DenseI64ArrayAttr for the MVP shape contract.
   auto radiusAttr = op->getAttrOfType<DenseI64ArrayAttr>("radius");
   if (!radiusAttr)
     return op.emitOpError("missing required `radius` attribute (expected array<i64:...>)");
@@ -45,7 +47,7 @@ static LogicalResult verifyApply(ApplyOp op) {
     return op.emitOpError("radius rank mismatch: radius has ")
            << radiusAttr.size() << " but bounds rank is " << rank;
 
-  // 检查 body：access offsets 维度匹配且 |offset|<=radius
+  // Check body: offsets rank matches and |offset|<=radius.
   Block &body = op.getBody().front();
   for (Operation &nested : body.getOperations()) {
     if (auto acc = dyn_cast<AccessOp>(nested)) {
@@ -65,10 +67,10 @@ static LogicalResult verifyApply(ApplyOp op) {
     }
 
     if (auto y = dyn_cast<YieldOp>(nested)) {
-      // 轻量检查：yield 至少 1 个结果（你也允许多个，但 MVP 我们先只支持 1 个）
+      // MVP: require exactly one value from yield.
       if (y.getNumOperands() != 1)
         return y.emitOpError("currently expect yield with exactly 1 operand for MVP");
-      // 类型一致性：yield 标量类型应等于 result TempType 的 elementType
+      // Yield type must match the temp element type.
       auto resTy = dyn_cast<TempType>(op.getResult().getType());
       if (!resTy) return op.emitOpError("result must be !neptune.temp<...>");
       Type elemTy = resTy.getElementType();
@@ -82,6 +84,7 @@ static LogicalResult verifyApply(ApplyOp op) {
   return success();
 }
 
+// Checks load for field->temp type/shape compatibility.
 static LogicalResult verifyLoad(LoadOp op) {
   auto fTy = dyn_cast<FieldType>(op.getVarField().getType());
   auto tTy = dyn_cast<TempType>(op.getResult().getType());
@@ -90,7 +93,7 @@ static LogicalResult verifyLoad(LoadOp op) {
   if (fTy.getElementType() != tTy.getElementType())
     return op.emitOpError("elementType mismatch between field and temp");
 
-  // 不强制 bounds 完全相等，但要求 rank 一致
+  // Bounds must at least agree on rank; exact equality is not required here.
   auto fr = getRankFromBounds(fTy.getBounds());
   auto tr = getRankFromBounds(tTy.getBounds());
   if (fr != tr)
@@ -103,6 +106,7 @@ static LogicalResult verifyLoad(LoadOp op) {
   return success();
 }
 
+// Checks store for temp->field type/shape compatibility.
 static LogicalResult verifyStore(StoreOp op) {
   auto tTy = dyn_cast<TempType>(op.getValue().getType());
   auto fTy = dyn_cast<FieldType>(op.getVarField().getType());
@@ -123,6 +127,7 @@ static LogicalResult verifyStore(StoreOp op) {
   return success();
 }
 
+// Walks the module and validates NeptuneIR form invariants.
 struct VerifyFormsPattern : OpRewritePattern<ModuleOp> {
   VerifyFormsPattern(MLIRContext *ctx) : OpRewritePattern(ctx) {}
   LogicalResult matchAndRewrite(ModuleOp module, PatternRewriter &rewriter) const override {
@@ -153,6 +158,7 @@ struct NeptuneIRVerifyFormsPass final
     auto module = dyn_cast<ModuleOp>(getOperation());
     MLIRContext *ctx = module.getContext();
 
+    // Single pass validation; no rewriting of ops.
     RewritePatternSet patterns(ctx);
     patterns.add<VerifyFormsPattern>(ctx);
 

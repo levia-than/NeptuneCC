@@ -11,3 +11,4 @@
 #include "Dialect/NeptuneIR/NeptuneIROpsAttrDefs.h.inc"
 
 #endif // NEPTUNEIR_NEPTUNEIRATTRS_H
+// Declares NeptuneIR attribute types (bounds, layout, shapes).

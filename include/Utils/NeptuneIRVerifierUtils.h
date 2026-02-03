@@ -74,3 +74,4 @@ inline LogicalResult verifyOffsetsWithinRadius(llvm::ArrayRef<int64_t> offsets,
 } // namespace mlir::Neptune::NeptuneIR::detail
 
 #endif // NEPTUNEIR_VERIFIER_UTILS_H
+// Helpers for validating NeptuneIR op/type constraints.

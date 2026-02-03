@@ -10,6 +10,7 @@
  * Copyright (c) 2025 by leviathan, All Rights Reserved.
  */
 #include "Dialect/NeptuneIR/NeptuneIRAttrs.h"
+// Implements verifier hooks for NeptuneIR types and ops.
 #include "Dialect/NeptuneIR/NeptuneIRDialect.h"
 #include "Dialect/NeptuneIR/NeptuneIROps.h"
 #include "Utils/NeptuneIRVerifierUtils.h"

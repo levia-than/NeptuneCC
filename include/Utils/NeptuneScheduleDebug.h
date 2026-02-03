@@ -97,3 +97,4 @@ class ScheduleEmitter {
 };
 
 }  // namespace neptune
+// Defines schedule debug records and dump interfaces for reproducibility.

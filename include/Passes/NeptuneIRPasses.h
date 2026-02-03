@@ -26,3 +26,4 @@ namespace mlir::Neptune::NeptuneIR {
 } // namespace mlir::Neptune::NeptuneIR
 
 #endif // NEPTUNEIR_LOWEREVALUATETOLOOPS_H
+// Declares NeptuneIR pass entry points.

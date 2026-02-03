@@ -14,3 +14,4 @@ void pairOverlaps(EventDB &db, clang::DiagnosticsEngine &DE);
 void bindOverlapsToBlocks(EventDB &db, clang::ASTContext &Ctx);
 
 } // namespace neptune
+// Connects parsed pragma events to Clang AST entities and types.

@@ -1,4 +1,4 @@
-// Infer deterministic Halide schedule from apply.
+// Infer a deterministic Halide schedule from apply bounds and radius.
 #include "Dialect/NeptuneIR/NeptuneIRDialect.h"
 #include "Dialect/NeptuneIR/NeptuneIROps.h"
 #include "Passes/NeptuneIRPasses.h"
@@ -31,6 +31,7 @@ namespace mlir::Neptune::NeptuneIR {
 namespace {
 using namespace mlir::Neptune::NeptuneIR;
 
+// Schedule knobs collected from environment and IR facts.
 struct ScheduleConfig {
   int64_t l1Bytes = 32 * 1024;
   double alpha = 0.6;
@@ -38,6 +39,7 @@ struct ScheduleConfig {
   int64_t vectorWidth = 1;
 };
 
+// Parses an integer env var; returns default on missing/invalid.
 static int64_t getEnvInt(llvm::StringRef name, int64_t defaultValue) {
   if (auto val = llvm::sys::Process::GetEnv(name)) {
     int64_t parsed = 0;
@@ -47,6 +49,7 @@ static int64_t getEnvInt(llvm::StringRef name, int64_t defaultValue) {
   return defaultValue;
 }
 
+// Parses a double env var; returns default on missing/invalid.
 static double getEnvDouble(llvm::StringRef name, double defaultValue) {
   if (auto val = llvm::sys::Process::GetEnv(name)) {
     if (!val->empty()) {
@@ -60,6 +63,7 @@ static double getEnvDouble(llvm::StringRef name, double defaultValue) {
   return defaultValue;
 }
 
+// Picks a deterministic thread count from common environment variables.
 static int64_t pickThreads() {
   // Deterministic order: NEPTUNECC_THREADS > HL_NUM_THREADS > OMP_NUM_THREADS.
   int64_t threads = getEnvInt("NEPTUNECC_THREADS", 0);
@@ -74,8 +78,8 @@ static int64_t pickThreads() {
   return 1;
 }
 
+// Vector width is user-controlled; default is scalar if not specified.
 static int64_t pickVectorWidth(bool &fromEnv) {
-  // Vector width is user-controlled; default is scalar if not specified.
   int64_t vl = getEnvInt("NEPTUNECC_VECTOR_WIDTH", 0);
   if (vl > 0) {
     fromEnv = true;
@@ -85,6 +89,7 @@ static int64_t pickVectorWidth(bool &fromEnv) {
   return 1;
 }
 
+// Emits a compact [a,b,c] list for logs.
 static void printArray(llvm::raw_ostream &os,
                        llvm::ArrayRef<int64_t> values) {
   os << '[';
@@ -96,6 +101,7 @@ static void printArray(llvm::raw_ostream &os,
   os << ']';
 }
 
+// Computes the product of a vector of extents.
 static int64_t product(llvm::ArrayRef<int64_t> values) {
   int64_t prod = 1;
   for (int64_t v : values)
@@ -103,6 +109,7 @@ static int64_t product(llvm::ArrayRef<int64_t> values) {
   return prod;
 }
 
+// Clamps a tile to the extent and vector alignment.
 static int64_t clampTile(int64_t cand, int64_t extent, int64_t vec) {
   int64_t t = cand < extent ? cand : extent;
   if (t < 1)
@@ -115,10 +122,10 @@ static int64_t clampTile(int64_t cand, int64_t extent, int64_t vec) {
   return t;
 }
 
+// Approximates cache footprint as (halo + tile) elements.
 static int64_t computeFootprint(int64_t elemBytes,
                                 llvm::ArrayRef<int64_t> tile,
                                 llvm::ArrayRef<int64_t> radius) {
-  // Approximate footprint: input halo + output tile.
   int64_t haloProd = 1;
   int64_t tileProd = 1;
   for (size_t i = 0, e = tile.size(); i < e; ++i) {
@@ -128,6 +135,7 @@ static int64_t computeFootprint(int64_t elemBytes,
   return elemBytes * (haloProd + tileProd);
 }
 
+// Candidate tiles for 1D; keeps the enumeration deterministic.
 static llvm::SmallVector<int64_t, 3>
 chooseTile1D(int64_t extentFast, int64_t vec) {
   llvm::SmallVector<int64_t, 3> candidates;
@@ -141,6 +149,7 @@ chooseTile1D(int64_t extentFast, int64_t vec) {
   return candidates;
 }
 
+// Candidate tiles for 2D; cartesian product of fixed lists.
 static llvm::SmallVector<std::pair<int64_t, int64_t>, 8>
 chooseTile2D(int64_t extentFast, int64_t extentSlow, int64_t vec) {
   llvm::SmallVector<int64_t, 3> txCandidates = {vec * 4, vec * 8, vec * 16};
@@ -161,6 +170,7 @@ chooseTile2D(int64_t extentFast, int64_t extentSlow, int64_t vec) {
   return out;
 }
 
+// Candidate tiles for 3D; conservative enumeration only.
 static llvm::SmallVector<llvm::SmallVector<int64_t, 3>, 8>
 chooseTile3D(int64_t extentFast, int64_t extentMid, int64_t extentSlow,
              int64_t vec) {
@@ -188,6 +198,7 @@ chooseTile3D(int64_t extentFast, int64_t extentMid, int64_t extentSlow,
   return out;
 }
 
+// Builds a schedule attr on apply; logs the decision for reproducibility.
 static bool inferScheduleForApply(func::FuncOp func, ApplyOp apply) {
   MLIRContext *ctx = apply.getContext();
   Location loc = apply.getLoc();
@@ -504,6 +515,7 @@ struct NeptuneIRInferHalideSchedulePass final
   void runOnOperation() override {
     func::FuncOp func = getOperation();
 
+    // Each apply gets its own schedule attribute; fail fast on errors.
     llvm::SmallVector<ApplyOp, 4> applies;
     func.walk([&](ApplyOp op) { applies.push_back(op); });
     if (applies.empty())

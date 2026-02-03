@@ -1,4 +1,4 @@
-// Normalize neptune.ir.apply patterns.
+// Keeps neptune.ir.apply radius explicit and consistent with access offsets.
 #include "Dialect/NeptuneIR/NeptuneIRAttrs.h"
 #include "Dialect/NeptuneIR/NeptuneIRDialect.h"
 #include "Dialect/NeptuneIR/NeptuneIROps.h"
@@ -23,11 +23,11 @@ namespace mlir::Neptune::NeptuneIR {
 namespace {
 using namespace mlir::Neptune::NeptuneIR;
 
-// 从 apply.body 里扫描所有 ir.access 的 offsets，推导每个维度的 max(|offset|)
+// Scans apply.body access offsets and derives per-dimension max(|offset|).
 static DenseI64ArrayAttr inferRadiusFromAccess(ApplyOp apply) {
   auto *ctx = apply.getContext();
 
-  // rank: 用 bounds.lb 的长度做 rank（你现在的 BoundsAttr 就是 DenseI64ArrayAttr）
+  // Rank comes from bounds.lb length; lb/ub are DenseI64ArrayAttr here.
   auto bounds = apply.getBounds();
   auto lb = bounds.getLb();
   int64_t rank = (int64_t)lb.size();
@@ -46,7 +46,9 @@ static DenseI64ArrayAttr inferRadiusFromAccess(ApplyOp apply) {
   return DenseI64ArrayAttr::get(ctx, r);
 }
 
-static LogicalResult verifyAccessWithinRadius(ApplyOp apply, DenseI64ArrayAttr radius) {
+// Verifies that all access offsets are within the declared radius.
+static LogicalResult verifyAccessWithinRadius(ApplyOp apply,
+                                              DenseI64ArrayAttr radius) {
   auto bounds = apply.getBounds();
   int64_t rank = (int64_t)bounds.getLb().size();
   if ((int64_t)radius.size() != rank)
@@ -77,11 +79,12 @@ static LogicalResult verifyAccessWithinRadius(ApplyOp apply, DenseI64ArrayAttr r
   return ok;
 }
 
+// Ensures apply radius is explicit and consistent with access offsets.
 struct NormalizeOneApply : OpRewritePattern<ApplyOp> {
   NormalizeOneApply(MLIRContext *ctx) : OpRewritePattern(ctx) {}
 
   LogicalResult matchAndRewrite(ApplyOp op, PatternRewriter &rewriter) const override {
-    // 1) 如果 radius 缺失：推导并补齐
+    // Fill missing radius from observed access offsets.
     DenseI64ArrayAttr radius;
     if (auto rAttr = op->getAttrOfType<DenseI64ArrayAttr>("radius")) {
       radius = rAttr;
@@ -90,11 +93,11 @@ struct NormalizeOneApply : OpRewritePattern<ApplyOp> {
       rewriter.modifyOpInPlace(op, [&]() { op->setAttr("radius", radius); });
     }
 
-    // 2) 校验 offsets ⊆ radius
+    // Reject accesses that claim a radius smaller than actual offsets.
     if (failed(verifyAccessWithinRadius(op, radius)))
       return failure();
 
-    // 你还可以在这里做更多 canonicalize：比如把等价表达式规整、合并常量等（以后再加）
+    // Keep the pass tight: only radius inference + validation for now.
     return success();
   }
 };
@@ -109,6 +112,7 @@ struct NeptuneIRNormalizeApplyPass final
     auto module = dyn_cast<ModuleOp>(getOperation());
     MLIRContext *ctx = module.getContext();
 
+    // Pattern-driven normalization: no control-flow changes here.
     RewritePatternSet patterns(ctx);
     patterns.add<NormalizeOneApply>(ctx);
 

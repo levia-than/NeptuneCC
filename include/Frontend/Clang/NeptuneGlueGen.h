@@ -13,3 +13,4 @@ bool writeHalideGenerators(const EventDB &db, llvm::StringRef outDir,
                            bool emitEmitcMLIR, bool emitHalideCpp);
 
 } // namespace neptune
+// Declares glue/rewriter generation for Halide AOT integration.

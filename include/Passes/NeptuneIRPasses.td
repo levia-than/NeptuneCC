@@ -83,4 +83,14 @@ def NeptuneIRInferHalideSchedulePass
   ];
 }
 
+def NeptuneIRInferOverlapStrategyPass
+    : Pass<"neptuneir-infer-overlap-strategy", "mlir::func::FuncOp"> {
+  let summary = "infer overlap strategy from apply bounds + halo model";
+  let dependentDialects = [
+    "mlir::func::FuncDialect",
+    "mlir::memref::MemRefDialect",
+    "Neptune::NeptuneIR::NeptuneIRDialect"
+  ];
+}
+
 #endif // NEPTUNEIR_PASSES_TD

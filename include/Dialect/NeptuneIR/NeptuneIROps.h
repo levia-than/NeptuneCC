@@ -33,3 +33,4 @@
 #include "Dialect/NeptuneIR/NeptuneIROps.h.inc"
 
 #endif
+// Declares NeptuneIR ops and builders.

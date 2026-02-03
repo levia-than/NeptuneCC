@@ -1,4 +1,4 @@
-// Clang frontend lowering to MLIR/NeptuneIR.
+// Lowers pragma-scoped C++ loops into NeptuneIR/SCF with metadata.
 #include "Frontend/Clang/NeptuneMLIRGen.h"
 
 #include "clang/AST/ASTContext.h"
@@ -225,6 +225,7 @@ static bool parsePortClause(llvm::StringRef clauseVal, bool isInput,
   return ok;
 }
 
+// Lowers a restricted C subset from a kernel block into MLIR ops.
 class KernelLowerer {
 public:
   KernelLowerer(clang::ASTContext &Ctx, mlir::func::FuncOp func,
@@ -249,6 +250,7 @@ public:
     bindVar(VD, value);
   }
 
+  // Entry point: lower a pragma-scoped block into a function body.
   mlir::LogicalResult lower(const clang::CompoundStmt *block,
                             mlir::Block *entry) {
     if (!entry) {
@@ -293,6 +295,7 @@ private:
     }
   }
 
+  // Statement dispatcher; rejects anything outside the supported subset.
   mlir::LogicalResult lowerStmt(clang::Stmt *stmt) {
     // Only a small C subset is supported inside kernel blocks.
     if (!stmt) {
@@ -322,6 +325,7 @@ private:
                            stmt->getStmtClassName());
   }
 
+  // Lowers a compound statement with scope tracking.
   mlir::LogicalResult lowerCompound(clang::CompoundStmt *CS) {
     pushScope();
     for (auto *child : CS->body()) {
@@ -334,6 +338,7 @@ private:
     return mlir::success();
   }
 
+  // Lowers local declarations into stack allocas or memrefs.
   mlir::LogicalResult lowerDecl(clang::DeclStmt *DS) {
     // Local scalar/array declarations become stack memrefs.
     for (auto *decl : DS->decls()) {
@@ -831,6 +836,7 @@ private:
     return true;
   }
 
+  // Extracts a VarDecl from an expression when possible.
   const clang::VarDecl *getVarDecl(clang::Expr *expr) {
     if (!expr) {
       return nullptr;
@@ -843,17 +849,20 @@ private:
     return llvm::dyn_cast<clang::VarDecl>(DRE->getDecl());
   }
 
+  // Emits a diagnostic and returns failure for unsupported constructs.
   mlir::LogicalResult emitUnsupported(clang::SourceLocation loc,
                                       llvm::StringRef kind) {
     DE.Report(loc, diagUnsupported) << kind;
     return mlir::failure();
   }
 
+  // Diagnoses non-canonical loops to keep lowering predictable.
   mlir::LogicalResult emitNonCanonicalFor(clang::ForStmt *FS) {
     DE.Report(FS->getForLoc(), diagNonCanonicalFor);
     return mlir::failure();
   }
 
+  // Diagnoses missing variables in the current scope map.
   mlir::LogicalResult emitMissingVar(clang::SourceLocation loc,
                                      const clang::VarDecl *VD) {
     llvm::StringRef name = VD ? VD->getName() : llvm::StringRef("<unknown>");

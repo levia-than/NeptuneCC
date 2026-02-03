@@ -11,6 +11,7 @@
 
 #include "Dialect/NeptuneIR/NeptuneIRAttrs.h"
 #include "Dialect/NeptuneIR/NeptuneIROps.h"
+// Defines the NeptuneIR dialect and registers ops/attrs.
 #include "Dialect/NeptuneIR/NeptuneIRDialect.h"
 
 #include "mlir/IR/Builders.h"

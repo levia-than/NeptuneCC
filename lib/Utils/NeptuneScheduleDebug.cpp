@@ -1,4 +1,5 @@
 // Schedule debug record + emitters for reproducible dumps.
+// Writes per-kernel schedule/debug artifacts (JSON/TXT/DOT).
 #include "Utils/NeptuneScheduleDebug.h"
 
 #include "llvm/ADT/SmallString.h"

@@ -1,4 +1,4 @@
-// Split stencil domains into interior/boundary.
+// Carves stencil domains into interior-only regions for later overlap passes.
 #include "Dialect/NeptuneIR/NeptuneIRAttrs.h"
 #include "Dialect/NeptuneIR/NeptuneIROps.h"
 #include "Passes/NeptuneIRPasses.h"
@@ -21,6 +21,7 @@ namespace mlir::Neptune::NeptuneIR {
 namespace {
 using namespace mlir::Neptune::NeptuneIR;
 
+// Pulls rank from bounds and rejects malformed lb/ub.
 static int64_t getRankFromBounds(BoundsAttr b) {
   if (!b) return -1;
   auto lb = b.getLb();
@@ -29,12 +30,13 @@ static int64_t getRankFromBounds(BoundsAttr b) {
   return (int64_t)lb.size();
 }
 
-static BoundsAttr shrinkToInterior(MLIRContext *ctx, BoundsAttr b, DenseI64ArrayAttr radius) {
+// Shrinks bounds to the safe interior: [lb + r, ub - r).
+static BoundsAttr shrinkToInterior(MLIRContext *ctx, BoundsAttr b,
+                                   DenseI64ArrayAttr radius) {
   auto lb = b.getLb();
   auto ub = b.getUb();
   int64_t rank = (int64_t)lb.size();
 
-  // Interior bounds = [lb + r, ub - r); keep exclusivity of ub.
   llvm::SmallVector<int64_t, 4> nlb(rank), nub(rank);
   for (int64_t d = 0; d < rank; ++d) {
     nlb[d] = lb[d] + radius[d];
@@ -45,6 +47,7 @@ static BoundsAttr shrinkToInterior(MLIRContext *ctx, BoundsAttr b, DenseI64Array
                          DenseI64ArrayAttr::get(ctx, nub));
 }
 
+// Rewrites apply bounds to the strict interior so overlap passes stay safe.
 struct InteriorOnlyPattern : OpRewritePattern<ApplyOp> {
   InteriorOnlyPattern(MLIRContext *ctx) : OpRewritePattern(ctx) {}
 
@@ -58,16 +61,17 @@ struct InteriorOnlyPattern : OpRewritePattern<ApplyOp> {
 
     auto ib = shrinkToInterior(op.getContext(), bounds, radius);
 
-    // 检查缩完是否空
+    // Reject empty interiors; overlap depends on a non-empty interior box.
     auto lb = ib.getLb();
     auto ub = ib.getUb();
     for (int64_t d = 0; d < rank; ++d) {
       if (lb[d] >= ub[d]) {
-        // interior 为空：不改
+        // Empty interior: keep original bounds.
         return failure();
       }
     }
 
+    // No-op if bounds already equal the interior box.
     if (ib == bounds) return failure();
     // Only rewrite apply's bounds attribute; keep type bounds stable for now.
     op.setBoundsAttr(ib);
@@ -85,8 +89,8 @@ struct NeptuneIRSplitDomainPass final
     auto module = dyn_cast<ModuleOp>(getOperation());
     MLIRContext *ctx = module.getContext();
 
+    // Only the interior-only mode is supported; keep the pass strict.
     if (mode != "interior-only") {
-      // MVP: only interior-only mode is supported.
       return;
     }
 

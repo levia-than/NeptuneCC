@@ -34,3 +34,4 @@ void buildNeptuneToLLVMPipeline(mlir::OpPassManager &pm);
 // 注册 Pipeline 到全局注册表 (供 neptune-opt 使用)
 void registerNeptunePipelines();
 } // namespace mlir::Neptune::NeptuneIR
+// Declares pass pipeline builders for NeptuneIR.

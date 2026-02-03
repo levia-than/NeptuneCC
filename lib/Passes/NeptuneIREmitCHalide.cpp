@@ -1,4 +1,4 @@
-// Emit Halide C++ via EmitC from NeptuneIR.
+// Emits Halide AOT generators from NeptuneIR apply via EmitC.
 #include "Dialect/NeptuneIR/NeptuneIRDialect.h"
 #include "Dialect/NeptuneIR/NeptuneIROps.h"
 #include "Passes/NeptuneIRPasses.h"

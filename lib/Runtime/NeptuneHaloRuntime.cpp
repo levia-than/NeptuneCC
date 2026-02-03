@@ -1,4 +1,5 @@
 // Default no-op halo runtime hooks.
+// Default no-op halo hooks; users can override at link time.
 #include "Runtime/NeptuneHaloRuntime.h"
 
 #include "llvm/Support/Process.h"
