@@ -1,1 +1,0 @@
-{"halo_blocks":[],"kernels":[{"block_begin_offset":177,"block_end_offset":367,"clauses":{"dm":"da","in":"x:ghosted","out":"y:owned"},"name":"k0","pragma_begin_offset":111,"pragma_end_offset":384,"tag":"k0"}],"overlaps":[],"version":1}
