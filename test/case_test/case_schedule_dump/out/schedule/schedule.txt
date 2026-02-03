@@ -1,0 +1,11 @@
+neptune-cc: schedule kernel=k0
+  rank=2 shape=8,8
+  bounds.lb=1,1 bounds.ub=7,7 radius=1,1
+  tile=6,6
+  vectorize={dim=last,factor=1,enabled=0}
+  unroll={dim=y,factor=2,enabled=1}
+  parallel={dim=none,threads=1,enabled=0} reason="threads<=1"
+  cache: L1=32768 alpha=6.000000e-01 footprint=400 fit=true
+  overlap: supported=true enabled=false reason="no overlap block"
+  rewrite: mode=PureHalide reason=""
+

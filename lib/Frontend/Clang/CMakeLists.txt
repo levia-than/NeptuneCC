@@ -21,6 +21,7 @@ target_link_libraries(NeptuneFrontendClang PUBLIC
   MLIRMemRefDialect
   MLIRNeptuneIRTransforms
   MLIRNeptuneIR
+  NeptuneUtils
 )
 
 include(AddLLVM)  # 提供 llvm_update_compile_flags

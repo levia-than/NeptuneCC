@@ -7,11 +7,13 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Types.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Target/Cpp/CppEmitter.h"
 #include "Passes/NeptuneIRPasses.h"
+#include "Utils/NeptuneScheduleDebug.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
@@ -45,6 +47,26 @@ struct CopyPairInfo {
   bool fullDomain = false;
 };
 
+struct ScheduleInfo {
+  bool valid = false;
+  int64_t rank = 0;
+  llvm::SmallVector<int64_t, 4> tile;
+  int64_t vec = 1;
+  std::string vecDim;
+  std::string vecReason;
+  int64_t unroll = 1;
+  std::string unrollDim;
+  std::string unrollReason;
+  std::string parDim;
+  std::string parReason;
+  int64_t threads = 1;
+  int64_t l1Bytes = 0;
+  double alpha = 0.0;
+  int64_t footprint = 0;
+  bool cacheFit = false;
+  llvm::SmallVector<std::string, 8> reorder;
+};
+
 struct KernelInfo {
   std::string tag;
   llvm::SmallVector<PortInfo, 8> ports;
@@ -64,6 +86,7 @@ struct KernelInfo {
   llvm::SmallVector<int64_t, 4> radius;
   std::string radiusSource;
   std::string boundsSource;
+  ScheduleInfo schedule;
   bool overlapSupported = false;
   std::string overlapReason;
   llvm::SmallVector<int64_t, 4> overlapInteriorLb;
@@ -80,6 +103,14 @@ struct Replacement {
   size_t start = 0;
   size_t end = 0;
   std::string text;
+};
+
+struct KernelDecisionInfo {
+  std::string mode;
+  std::string reason;
+  std::string boundaryCopyMode;
+  bool overlapCovered = false;
+  bool overlapRewritten = false;
 };
 
 struct CodeWriter {
@@ -117,6 +148,7 @@ struct ApplyStencilInfo {
   llvm::SmallVector<int64_t, 4> ub;
   llvm::SmallVector<int64_t, 4> radius;
   std::string radiusSource;
+  ScheduleInfo schedule;
   llvm::SmallVector<unsigned, 4> applyInputArgs;
   std::optional<unsigned> applyOutputArg;
   bool hasResidualScf = false;
@@ -256,6 +288,63 @@ static bool computeOverlapRegions(KernelInfo &info) {
   return true;
 }
 static std::string parseBoundaryCopyMode();
+
+static ScheduleInfo parseScheduleAttr(mlir::DictionaryAttr dict, size_t rank) {
+  ScheduleInfo info;
+  if (!dict)
+    return info;
+
+  auto splitAttr = dict.getAs<mlir::DenseI64ArrayAttr>("split");
+  if (!splitAttr)
+    return info;
+  auto splitVals = splitAttr.asArrayRef();
+  if (splitVals.size() != rank)
+    return info;
+  info.tile.assign(splitVals.begin(), splitVals.end());
+  info.rank = static_cast<int64_t>(rank);
+
+  if (auto rankAttr = dict.getAs<mlir::IntegerAttr>("rank"))
+    info.rank = rankAttr.getInt();
+  if (auto vecAttr = dict.getAs<mlir::IntegerAttr>("vec"))
+    info.vec = vecAttr.getInt();
+  if (auto vecDimAttr = dict.getAs<mlir::StringAttr>("vec_dim"))
+    info.vecDim = vecDimAttr.getValue().str();
+  if (auto vecReasonAttr = dict.getAs<mlir::StringAttr>("vec_reason"))
+    info.vecReason = vecReasonAttr.getValue().str();
+  if (auto parDimAttr = dict.getAs<mlir::StringAttr>("par_dim"))
+    info.parDim = parDimAttr.getValue().str();
+  if (auto parReasonAttr = dict.getAs<mlir::StringAttr>("par_reason"))
+    info.parReason = parReasonAttr.getValue().str();
+  if (auto unrollAttr = dict.getAs<mlir::IntegerAttr>("unroll_factor"))
+    info.unroll = unrollAttr.getInt();
+  else if (auto unrollAttr = dict.getAs<mlir::IntegerAttr>("unroll"))
+    info.unroll = unrollAttr.getInt();
+  if (auto unrollDimAttr = dict.getAs<mlir::StringAttr>("unroll_dim"))
+    info.unrollDim = unrollDimAttr.getValue().str();
+  if (auto unrollReasonAttr = dict.getAs<mlir::StringAttr>("unroll_reason"))
+    info.unrollReason = unrollReasonAttr.getValue().str();
+  if (auto threadsAttr = dict.getAs<mlir::IntegerAttr>("threads"))
+    info.threads = threadsAttr.getInt();
+  if (auto l1Attr = dict.getAs<mlir::IntegerAttr>("l1_bytes"))
+    info.l1Bytes = l1Attr.getInt();
+  if (auto alphaAttr = dict.getAs<mlir::FloatAttr>("cache_alpha"))
+    info.alpha = alphaAttr.getValueAsDouble();
+  if (auto footprintAttr = dict.getAs<mlir::IntegerAttr>("footprint_bytes"))
+    info.footprint = footprintAttr.getInt();
+  if (auto cacheFitAttr = dict.getAs<mlir::BoolAttr>("cache_fit"))
+    info.cacheFit = cacheFitAttr.getValue();
+  if (auto reorderAttr = dict.getAs<mlir::ArrayAttr>("reorder")) {
+    for (mlir::Attribute attr : reorderAttr) {
+      auto strAttr = llvm::dyn_cast<mlir::StringAttr>(attr);
+      if (!strAttr)
+        continue;
+      info.reorder.push_back(strAttr.getValue().str());
+    }
+  }
+
+  info.valid = true;
+  return info;
+}
 
 static bool matchConstantIndex(mlir::Value v, int64_t &out) {
   auto cst = v.getDefiningOp<mlir::arith::ConstantOp>();
@@ -594,6 +683,8 @@ inferStencilFromApply(mlir::ModuleOp module, mlir::func::FuncOp func) {
       mlir::Neptune::NeptuneIR::createSCFBoundarySimplifyPass());
   pm.addNestedPass<mlir::func::FuncOp>(
       mlir::Neptune::NeptuneIR::createSCFToNeptuneIRPass());
+  pm.addNestedPass<mlir::func::FuncOp>(
+      mlir::Neptune::NeptuneIR::createNeptuneIRInferHalideSchedulePass());
   if (mlir::failed(pm.run(clone))) {
     return std::nullopt;
   }
@@ -695,6 +786,11 @@ inferStencilFromApply(mlir::ModuleOp module, mlir::func::FuncOp func) {
   if (!arg || arg.getOwner() != &clonedFunc.getBody().front())
     return std::nullopt;
   info.applyOutputArg = arg.getArgNumber();
+
+  if (auto schedAttr =
+          apply->getAttrOfType<mlir::DictionaryAttr>("neptune.schedule")) {
+    info.schedule = parseScheduleAttr(schedAttr, info.lb.size());
+  }
 
   analyzeResidualCopyBoundary(clonedFunc, apply, info);
 
@@ -834,6 +930,16 @@ static const PortInfo *findPortByArgIndex(const KernelInfo &info,
   return nullptr;
 }
 
+static const PortInfo *pickShapePort(const KernelInfo &info) {
+  for (const auto &port : info.ports) {
+    if (!port.isInput)
+      return &port;
+  }
+  if (!info.ports.empty())
+    return &info.ports.front();
+  return nullptr;
+}
+
 static bool isHalideArg(const KernelInfo &info, unsigned argIndex) {
   for (unsigned arg : info.halideArgs) {
     if (arg == argIndex) {
@@ -933,6 +1039,9 @@ static bool collectKernelInfos(const EventDB &db,
     const PortInfo *inPort = nullptr;
     const PortInfo *outPort = nullptr;
     auto applyInfo = inferStencilFromApply(module, func);
+    if (applyInfo) {
+      info.schedule = applyInfo->schedule;
+    }
     if (applyInfo && applyInfo->applyOutputArg &&
         !applyInfo->applyInputArgs.empty()) {
       bool ok = true;
@@ -1342,6 +1451,113 @@ static void logOverlapInfo(const KernelInfo &info, llvm::raw_ostream &os) {
     printI64Array(os, face.ub);
     os << ")\n";
   }
+}
+
+static ScheduleDecision buildScheduleDecision(const ScheduleInfo &info) {
+  ScheduleDecision out;
+  out.valid = info.valid;
+  if (!info.valid)
+    return out;
+  out.rank = info.rank;
+  out.tile.assign(info.tile.begin(), info.tile.end());
+  out.vec = info.vec;
+  out.vecDim = info.vecDim.empty() ? "last" : info.vecDim;
+  out.vecReason = info.vecReason;
+  out.unroll = info.unroll;
+  out.unrollDim = info.unrollDim.empty() ? "none" : info.unrollDim;
+  out.unrollReason = info.unrollReason;
+  out.parDim = info.parDim.empty() ? "none" : info.parDim;
+  out.parReason = info.parReason;
+  out.threads = info.threads;
+  out.l1Bytes = info.l1Bytes;
+  out.alpha = info.alpha;
+  out.footprint = info.footprint;
+  out.cacheFit = info.cacheFit;
+  out.reorder.assign(info.reorder.begin(), info.reorder.end());
+  return out;
+}
+
+static OverlapPlan buildOverlapPlan(const KernelInfo &info,
+                                    const KernelDecisionInfo &decision) {
+  OverlapPlan plan;
+  plan.supported = info.overlapSupported;
+  plan.enabled = decision.overlapRewritten;
+  if (!info.overlapSupported) {
+    plan.reason = info.overlapReason;
+  } else if (plan.enabled) {
+    plan.reason = "";
+  } else if (decision.overlapCovered && !decision.reason.empty()) {
+    plan.reason = decision.reason;
+  } else if (decision.overlapCovered) {
+    plan.reason = "overlap skipped";
+  } else {
+    plan.reason = "no overlap block";
+  }
+  if (info.overlapSupported) {
+    plan.interiorLb.assign(info.overlapInteriorLb.begin(),
+                           info.overlapInteriorLb.end());
+    plan.interiorUb.assign(info.overlapInteriorUb.begin(),
+                           info.overlapInteriorUb.end());
+    for (const auto &face : info.overlapFaces) {
+      OverlapRegion region;
+      region.name = face.suffix;
+      region.lb.assign(face.lb.begin(), face.lb.end());
+      region.ub.assign(face.ub.begin(), face.ub.end());
+      plan.faces.push_back(std::move(region));
+    }
+  }
+  return plan;
+}
+
+static KernelScheduleRecord buildScheduleRecord(
+    const KernelInfo &info, const KernelDecisionInfo &decision) {
+  KernelScheduleRecord rec;
+  rec.tag = info.tag;
+  rec.name = info.tag;
+  if (const PortInfo *shapePort = pickShapePort(info)) {
+    rec.rank = static_cast<int64_t>(shapePort->rank);
+    rec.shape.assign(shapePort->shape.begin(), shapePort->shape.end());
+  }
+  rec.outMin.assign(info.outMin.begin(), info.outMin.end());
+  rec.outExtent.assign(info.outExtent.begin(), info.outExtent.end());
+  rec.radius.assign(info.radius.begin(), info.radius.end());
+  for (const auto &port : info.ports) {
+    PortRecord pr;
+    pr.name = port.name;
+    pr.direction = port.isInput ? "in" : "out";
+    pr.qualifier = port.isGhosted ? "ghosted" : "owned";
+    pr.ghosted = port.isGhosted;
+    pr.roleIndex = port.roleIndex;
+    pr.argIndex = port.argIndex;
+    rec.ports.push_back(std::move(pr));
+  }
+  rec.schedule = buildScheduleDecision(info.schedule);
+  rec.overlap = buildOverlapPlan(info, decision);
+  rec.rewrite.mode = decision.mode;
+  rec.rewrite.reason = decision.reason;
+  rec.rewrite.boundaryCopyMode = decision.boundaryCopyMode;
+  return rec;
+}
+
+static void emitScheduleDebug(llvm::StringRef outDir,
+                              llvm::ArrayRef<KernelInfo> kernels,
+                              const llvm::StringMap<KernelDecisionInfo> &decisions) {
+  if (!scheduleDumpEnabled())
+    return;
+  ScheduleEmitter emitter(outDir, /*enableJson=*/true, /*enableTxt=*/true,
+                          /*enableDot=*/scheduleDotEnabled());
+  for (const auto &kernel : kernels) {
+    KernelDecisionInfo decision;
+    auto it = decisions.find(kernel.tag);
+    if (it != decisions.end()) {
+      decision = it->second;
+    } else {
+      decision.mode = "Unknown";
+      decision.reason = "no decision";
+    }
+    emitter.recordKernel(buildScheduleRecord(kernel, decision));
+  }
+  (void)emitter.flush();
 }
 
 static void emitKernelSignatureWithName(llvm::raw_ostream &os,
@@ -2233,6 +2449,30 @@ bool rewriteKernelSources(const EventDB &db, llvm::StringRef outDir) {
     return false;
   }
 
+  llvm::StringMap<KernelDecisionInfo> decisions;
+  for (const auto &kernel : kernels) {
+    KernelDecisionInfo decision;
+    if (!kernel.halideCompatible) {
+      decision.mode = "SkipRewrite";
+      decision.reason = "missing apply-mapped input/output";
+    } else if (!kernel.boundsValid) {
+      decision.mode = "SkipRewrite";
+      decision.reason = "no valid stencil bounds";
+    } else if (kernel.hasResidualScf && !kernel.partialCopyBoundary) {
+      decision.mode = "SkipRewrite";
+      decision.reason =
+          kernel.residualReason.empty()
+              ? "residual_scf_not_copy_boundary"
+              : ("residual_scf_not_copy_boundary: " + kernel.residualReason);
+    } else if (kernel.hasResidualScf && kernel.partialCopyBoundary) {
+      decision.mode = "PartialRewrite";
+      decision.boundaryCopyMode = kernel.boundaryCopyMode;
+    } else {
+      decision.mode = "PureHalide";
+    }
+    decisions[kernel.tag] = std::move(decision);
+  }
+
   llvm::StringMap<const KernelInfo *> kernelByTag;
   for (const auto &kernel : kernels) {
     kernelByTag[kernel.tag] = &kernel;
@@ -2285,12 +2525,15 @@ bool rewriteKernelSources(const EventDB &db, llvm::StringRef outDir) {
 
   llvm::StringMap<llvm::SmallVector<const OverlapInterval *, 4>>
       overlapsByFile;
+  llvm::StringMap<bool> overlapCoverage;
   for (const auto &ov : db.overlaps) {
     if (!ov.blockBegin.isValid() || !ov.blockEnd.isValid())
       continue;
     if (ov.begin.filePath.empty())
       continue;
     overlapsByFile[ov.begin.filePath].push_back(&ov);
+    if (!ov.kernelTag.empty())
+      overlapCoverage[ov.kernelTag] = true;
   }
   for (const auto &kernel : db.kernels) {
     if (!kernel.blockBegin.isValid() || !kernel.blockEnd.isValid()) {
@@ -2324,6 +2567,11 @@ bool rewriteKernelSources(const EventDB &db, llvm::StringRef outDir) {
     if (filePath.empty()) {
       llvm::errs() << "neptune-cc: missing source path for kernel '" << tag
                    << "'\n";
+      auto decIt = decisions.find(tag);
+      if (decIt != decisions.end() && !decIt->second.overlapCovered) {
+        decIt->second.mode = "SkipRewrite";
+        decIt->second.reason = "missing source path";
+      }
       continue;
     }
 
@@ -2341,6 +2589,14 @@ bool rewriteKernelSources(const EventDB &db, llvm::StringRef outDir) {
       }
     }
     if (coveredByOverlap) {
+      auto decIt = decisions.find(tag);
+      if (decIt != decisions.end()) {
+        decIt->second.overlapCovered = true;
+        if (decIt->second.mode != "SkipRewrite") {
+          decIt->second.mode = "OverlapRewrite";
+          decIt->second.reason = "pending";
+        }
+      }
       continue;
     }
 
@@ -2348,6 +2604,11 @@ bool rewriteKernelSources(const EventDB &db, llvm::StringRef outDir) {
     if (!bufferOrErr) {
       llvm::errs() << "neptune-cc: failed to read source '" << filePath
                    << "': " << bufferOrErr.getError().message() << "\n";
+      auto decIt = decisions.find(tag);
+      if (decIt != decisions.end() && !decIt->second.overlapCovered) {
+        decIt->second.mode = "SkipRewrite";
+        decIt->second.reason = "failed to read source";
+      }
       continue;
     }
     llvm::StringRef contentRef = bufferOrErr.get()->getBuffer();
@@ -2357,6 +2618,11 @@ bool rewriteKernelSources(const EventDB &db, llvm::StringRef outDir) {
     if (beginOffset > contentRef.size() || endOffset > contentRef.size()) {
       llvm::errs() << "neptune-cc: kernel offsets out of range for '" << tag
                    << "'\n";
+      auto decIt = decisions.find(tag);
+      if (decIt != decisions.end() && !decIt->second.overlapCovered) {
+        decIt->second.mode = "SkipRewrite";
+        decIt->second.reason = "kernel offsets out of range";
+      }
       continue;
     }
 
@@ -2364,6 +2630,11 @@ bool rewriteKernelSources(const EventDB &db, llvm::StringRef outDir) {
     size_t end = findLineEnd(contentRef, endOffset);
     if (start >= end) {
       llvm::errs() << "neptune-cc: invalid kernel range for '" << tag << "'\n";
+      auto decIt = decisions.find(tag);
+      if (decIt != decisions.end() && !decIt->second.overlapCovered) {
+        decIt->second.mode = "SkipRewrite";
+        decIt->second.reason = "invalid kernel range";
+      }
       continue;
     }
 
@@ -2387,6 +2658,32 @@ bool rewriteKernelSources(const EventDB &db, llvm::StringRef outDir) {
     filesWithKernelReplace.insert(filePath);
   }
 
+  auto markOverlapSkip = [&](llvm::StringRef kernelTag,
+                             llvm::StringRef reason) {
+    auto it = decisions.find(kernelTag);
+    if (it == decisions.end())
+      return;
+    KernelDecisionInfo &dec = it->second;
+    dec.overlapCovered = true;
+    if (dec.overlapRewritten)
+      return;
+    if (dec.mode == "SkipRewrite" && !dec.reason.empty())
+      return;
+    dec.mode = "SkipRewrite";
+    dec.reason = std::string("overlap_skip: ") + reason.str();
+  };
+
+  auto markOverlapSuccess = [&](llvm::StringRef kernelTag) {
+    auto it = decisions.find(kernelTag);
+    if (it == decisions.end())
+      return;
+    KernelDecisionInfo &dec = it->second;
+    dec.overlapCovered = true;
+    dec.overlapRewritten = true;
+    dec.mode = "OverlapRewrite";
+    dec.reason.clear();
+  };
+
   for (auto &entry : overlapsByFile) {
     llvm::StringRef filePath = entry.getKey();
     auto bufferOrErr = llvm::MemoryBuffer::getFile(filePath);
@@ -2401,11 +2698,15 @@ bool rewriteKernelSources(const EventDB &db, llvm::StringRef outDir) {
       if (ov->kernelTag.empty() || ov->haloTag.empty()) {
         llvm::errs() << "neptune-cc: skip overlap rewrite for tag '"
                      << ov->begin.tag << "' (missing halo/kernel)\n";
+        if (!ov->kernelTag.empty()) {
+          markOverlapSkip(ov->kernelTag, "missing halo/kernel");
+        }
         continue;
       }
       if (ov->blockBeginOffset >= ov->blockEndOffset) {
         llvm::errs() << "neptune-cc: skip overlap rewrite for tag '"
                      << ov->begin.tag << "' (invalid block)\n";
+        markOverlapSkip(ov->kernelTag, "invalid block");
         continue;
       }
 
@@ -2413,6 +2714,7 @@ bool rewriteKernelSources(const EventDB &db, llvm::StringRef outDir) {
       if (kInfoIt == kernelByTag.end()) {
         llvm::errs() << "neptune-cc: skip overlap rewrite for tag '"
                      << ov->begin.tag << "' (missing kernel info)\n";
+        markOverlapSkip(ov->kernelTag, "missing kernel info");
         continue;
       }
       const KernelInfo *kinfo = kInfoIt->second;
@@ -2423,6 +2725,10 @@ bool rewriteKernelSources(const EventDB &db, llvm::StringRef outDir) {
                              ? "overlap unsupported"
                              : kinfo->overlapReason)
                      << ")\n";
+        markOverlapSkip(ov->kernelTag,
+                        kinfo->overlapReason.empty()
+                            ? "overlap unsupported"
+                            : kinfo->overlapReason);
         continue;
       }
 
@@ -2431,6 +2737,7 @@ bool rewriteKernelSources(const EventDB &db, llvm::StringRef outDir) {
       if (!kInterval) {
         llvm::errs() << "neptune-cc: skip overlap rewrite for tag '"
                      << ov->begin.tag << "' (kernel not uniquely inside)\n";
+        markOverlapSkip(ov->kernelTag, "kernel not uniquely inside");
         continue;
       }
       const HaloInterval *hInterval = findHaloInterval(
@@ -2438,6 +2745,7 @@ bool rewriteKernelSources(const EventDB &db, llvm::StringRef outDir) {
       if (!hInterval) {
         llvm::errs() << "neptune-cc: skip overlap rewrite for tag '"
                      << ov->begin.tag << "' (halo not uniquely inside)\n";
+        markOverlapSkip(ov->kernelTag, "halo not uniquely inside");
         continue;
       }
 
@@ -2461,6 +2769,7 @@ bool rewriteKernelSources(const EventDB &db, llvm::StringRef outDir) {
             haloEndLineStart <= blockBodyEnd)) {
         llvm::errs() << "neptune-cc: skip overlap rewrite for tag '"
                      << ov->begin.tag << "' (unexpected ordering)\n";
+        markOverlapSkip(ov->kernelTag, "unexpected ordering");
         continue;
       }
 
@@ -2471,6 +2780,7 @@ bool rewriteKernelSources(const EventDB &db, llvm::StringRef outDir) {
         llvm::errs() << "neptune-cc: skip overlap rewrite for tag '"
                      << ov->begin.tag << "' (extra statements between kernel "
                      << "and halo end)\n";
+        markOverlapSkip(ov->kernelTag, "extra statements between kernel/halo");
         continue;
       }
 
@@ -2520,9 +2830,11 @@ bool rewriteKernelSources(const EventDB &db, llvm::StringRef outDir) {
       replacementsByFile[filePath].push_back(std::move(repl));
       filesToRewrite.insert(filePath);
       filesWithKernelReplace.insert(filePath);
+      markOverlapSuccess(ov->kernelTag);
     }
   }
 
+  emitScheduleDebug(outDir, kernels, decisions);
   if (filesToRewrite.empty()) {
     return true;
   }

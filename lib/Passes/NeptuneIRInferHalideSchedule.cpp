@@ -6,6 +6,8 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/BuiltinTypes.h"
 #include "mlir/Pass/Pass.h"
 
 #include "llvm/ADT/ArrayRef.h"
@@ -253,12 +255,14 @@ static bool inferScheduleForApply(func::FuncOp func, ApplyOp apply) {
   int64_t extentFast = outExtent[rank - 1];
   int64_t vec = cfg.vectorWidth;
   bool vectorDisabled = false;
+  std::string vecReason;
   if (vec < 1)
     vec = 1;
   // Do not vectorize if the fast extent is smaller than the vector width.
   if (extentFast < vec) {
     vec = 1;
     vectorDisabled = true;
+    vecReason = "extent<VL";
   }
 
   llvm::SmallVector<int64_t, 4> tile(rank, 1);
@@ -347,6 +351,8 @@ static bool inferScheduleForApply(func::FuncOp func, ApplyOp apply) {
 
   if (bestVolume < 0)
     tile = outExtent;
+  bestFootprint = computeFootprint(elemBytes, tile, radius);
+  bool cacheFit = static_cast<double>(bestFootprint) <= limit;
 
   int64_t yIndex = (rank >= 2) ? static_cast<int64_t>(rank - 2) : -1;
   int64_t yExtent = (yIndex >= 0) ? outExtent[static_cast<size_t>(yIndex)] : 0;
@@ -355,6 +361,7 @@ static bool inferScheduleForApply(func::FuncOp func, ApplyOp apply) {
     yTile = yExtent;
 
   llvm::StringRef parDim = "none";
+  std::string parReason;
   if (cfg.threads > 1) {
     // Parallelize the slowest useful outer tile dimension.
     if (rank == 2) {
@@ -369,6 +376,11 @@ static bool inferScheduleForApply(func::FuncOp func, ApplyOp apply) {
       else if (extentY >= tile[1] * 2)
         parDim = "y";
     }
+  }
+  if (cfg.threads <= 1) {
+    parReason = "threads<=1";
+  } else if (parDim == "none") {
+    parReason = "extent too small";
   }
 
   int64_t unroll = 1;
@@ -406,18 +418,51 @@ static bool inferScheduleForApply(func::FuncOp func, ApplyOp apply) {
 
   NamedAttrList scheduleAttrs;
   // Persist schedule for the emitter; do not bake logic into EmitC.
+  scheduleAttrs.set("rank", IntegerAttr::get(IntegerType::get(ctx, 64), rank));
+  scheduleAttrs.set("shape", DenseI64ArrayAttr::get(ctx, shape));
+  scheduleAttrs.set("out_min", DenseI64ArrayAttr::get(ctx, outMin));
+  scheduleAttrs.set("out_extent", DenseI64ArrayAttr::get(ctx, outExtent));
+  scheduleAttrs.set("radius", DenseI64ArrayAttr::get(ctx, radius));
   scheduleAttrs.set("split", DenseI64ArrayAttr::get(ctx, tile));
   scheduleAttrs.set("vec", IntegerAttr::get(IntegerType::get(ctx, 64), vec));
+  scheduleAttrs.set("vec_dim", StringAttr::get(ctx, "last"));
+  scheduleAttrs.set("vec_reason", StringAttr::get(ctx, vecReason));
   scheduleAttrs.set("par_dim", StringAttr::get(ctx, parDim));
+  scheduleAttrs.set("par_reason", StringAttr::get(ctx, parReason));
   scheduleAttrs.set("unroll",
                     IntegerAttr::get(IntegerType::get(ctx, 64), unroll));
   scheduleAttrs.set("unroll_dim", StringAttr::get(ctx, unrollDim));
   scheduleAttrs.set(
       "unroll_factor",
       IntegerAttr::get(IntegerType::get(ctx, 64), unroll));
+  scheduleAttrs.set("unroll_reason",
+                    StringAttr::get(ctx, unrollReason));
   scheduleAttrs.set(
       "threads",
       IntegerAttr::get(IntegerType::get(ctx, 64), cfg.threads));
+  scheduleAttrs.set("l1_bytes",
+                    IntegerAttr::get(IntegerType::get(ctx, 64),
+                                     cfg.l1Bytes));
+  scheduleAttrs.set("cache_alpha",
+                    FloatAttr::get(Float64Type::get(ctx), cfg.alpha));
+  scheduleAttrs.set("footprint_bytes",
+                    IntegerAttr::get(IntegerType::get(ctx, 64),
+                                     bestFootprint));
+  scheduleAttrs.set("cache_fit", BoolAttr::get(ctx, cacheFit));
+  if (rank == 2) {
+    scheduleAttrs.set("reorder", ArrayAttr::get(
+                                   ctx, {StringAttr::get(ctx, "xi"),
+                                         StringAttr::get(ctx, "yi"),
+                                         StringAttr::get(ctx, "xo"),
+                                         StringAttr::get(ctx, "yo")}));
+  } else if (rank == 3) {
+    scheduleAttrs.set("reorder", ArrayAttr::get(
+                                   ctx, {StringAttr::get(ctx, "xi"),
+                                         StringAttr::get(ctx, "yi"),
+                                         StringAttr::get(ctx, "z"),
+                                         StringAttr::get(ctx, "xo"),
+                                         StringAttr::get(ctx, "yo")}));
+  }
   apply->setAttr("neptune.schedule", DictionaryAttr::get(ctx, scheduleAttrs));
 
   llvm::outs() << "neptune-cc: schedule for '" << func.getSymName()
