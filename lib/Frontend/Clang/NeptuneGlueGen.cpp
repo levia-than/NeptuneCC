@@ -48,6 +48,14 @@ struct CopyPairInfo {
   bool fullDomain = false;
 };
 
+struct CornerStoreInfo {
+  unsigned outArgIndex = 0;
+  std::optional<unsigned> inArgIndex;
+  bool isConst = false;
+  int64_t constValue = 0;
+  llvm::SmallVector<int64_t, 4> indices;
+};
+
 struct ScheduleInfo {
   bool valid = false;
   int64_t rank = 0;
@@ -115,6 +123,7 @@ struct KernelInfo {
   bool hasResidualScf = false;
   std::string residualReason;
   llvm::SmallVector<CopyPairInfo, 4> copyPairs;
+  llvm::SmallVector<CornerStoreInfo, 4> cornerStores;
   llvm::SmallVector<unsigned, 4> halideArgs;
   std::string boundaryCopyMode;
   llvm::SmallVector<int64_t, 4> outMin;
@@ -193,6 +202,7 @@ struct ApplyStencilInfo {
   bool hasResidualScf = false;
   bool residualCopyBoundary = false;
   llvm::SmallVector<CopyPairInfo, 4> copyPairs;
+  llvm::SmallVector<CornerStoreInfo, 4> cornerStores;
   std::string residualReason;
 };
 
@@ -491,6 +501,19 @@ static bool matchConstantIndex(mlir::Value v, int64_t &out) {
   return true;
 }
 
+static bool matchConstantIntValue(mlir::Value v, int64_t &out) {
+  auto cst = v.getDefiningOp<mlir::arith::ConstantOp>();
+  if (!cst) {
+    return false;
+  }
+  auto attr = llvm::dyn_cast<mlir::IntegerAttr>(cst.getValue());
+  if (!attr) {
+    return false;
+  }
+  out = attr.getInt();
+  return true;
+}
+
 static std::string parseBoundaryCopyMode() {
   const char *modeEnv = std::getenv("NEPTUNECC_BOUNDARY_COPY_MODE");
   if (!modeEnv || modeEnv[0] == '\0') {
@@ -553,6 +576,175 @@ static void addCopyPair(llvm::SmallVectorImpl<CopyPairInfo> &pairs,
   info.outArgIndex = outArg;
   info.fullDomain = fullDomain;
   pairs.push_back(info);
+}
+
+static bool loopHasCornerStore(mlir::scf::ForOp loop) {
+  bool found = false;
+  loop.walk([&](mlir::memref::StoreOp store) {
+    if (store->hasAttr("neptune.corner")) {
+      found = true;
+    }
+  });
+  return found;
+}
+
+static bool collectCornerStoresFromLoopNest(
+    mlir::scf::ForOp outer, llvm::SmallVectorImpl<CornerStoreInfo> &stores,
+    std::string &reason) {
+  auto func = outer->getParentOfType<mlir::func::FuncOp>();
+  if (!func) {
+    reason = "corner loop not inside func";
+    return false;
+  }
+
+  llvm::SmallVector<mlir::scf::ForOp, 4> loops;
+  llvm::SmallVector<int64_t, 4> cornerIdx;
+  mlir::scf::ForOp current = outer;
+  while (true) {
+    int64_t step = 0;
+    if (!matchConstantIndex(current.getStep(), step) || step != 1) {
+      reason = "corner loop step != 1";
+      return false;
+    }
+    int64_t lb = 0;
+    int64_t ub = 0;
+    if (!matchConstantIndex(current.getLowerBound(), lb) ||
+        !matchConstantIndex(current.getUpperBound(), ub)) {
+      reason = "corner loop bound not constant";
+      return false;
+    }
+    if (ub != lb + 1) {
+      reason = "corner loop extent != 1";
+      return false;
+    }
+    loops.push_back(current);
+    cornerIdx.push_back(lb);
+    if (loops.size() > 3) {
+      reason = "corner loop rank > 3";
+      return false;
+    }
+
+    mlir::scf::ForOp inner;
+    bool sawLoadStore = false;
+    for (mlir::Operation &op : current.getBody()->without_terminator()) {
+      if (auto nested = llvm::dyn_cast<mlir::scf::ForOp>(op)) {
+        if (inner || sawLoadStore) {
+          reason = "non-perfect corner loop nest";
+          return false;
+        }
+        inner = nested;
+        continue;
+      }
+      if (llvm::isa<mlir::memref::LoadOp, mlir::memref::StoreOp>(op)) {
+        sawLoadStore = true;
+        continue;
+      }
+      if (llvm::isa<mlir::memref::CastOp>(op) || isConstLikeOp(&op)) {
+        continue;
+      }
+      reason = "unsupported op in corner loop";
+      return false;
+    }
+    if (inner) {
+      current = inner;
+      continue;
+    }
+
+    llvm::DenseMap<mlir::Value, mlir::memref::LoadOp> loads;
+    bool sawStore = false;
+    for (mlir::Operation &op : current.getBody()->without_terminator()) {
+      if (auto load = llvm::dyn_cast<mlir::memref::LoadOp>(op)) {
+        auto memref = stripMemrefCasts(load.getMemref());
+        auto memrefTy = llvm::dyn_cast<mlir::MemRefType>(memref.getType());
+        if (!memrefTy || memrefTy.getRank() != static_cast<int>(loops.size())) {
+          reason = "corner load rank mismatch";
+          return false;
+        }
+        auto arg = llvm::dyn_cast<mlir::BlockArgument>(memref);
+        if (!arg || arg.getOwner() != &func.getBody().front()) {
+          reason = "corner load memref not block argument";
+          return false;
+        }
+        if (load.getIndices().size() != loops.size()) {
+          reason = "corner load indices mismatch";
+          return false;
+        }
+        for (size_t i = 0; i < loops.size(); ++i) {
+          if (load.getIndices()[i] != loops[i].getInductionVar()) {
+            reason = "corner load indices not ivs";
+            return false;
+          }
+        }
+        loads[load.getResult()] = load;
+        continue;
+      }
+      if (auto store = llvm::dyn_cast<mlir::memref::StoreOp>(op)) {
+        if (!store->hasAttr("neptune.corner")) {
+          reason = "non-corner store in corner loop";
+          return false;
+        }
+        auto memref = stripMemrefCasts(store.getMemref());
+        auto memrefTy = llvm::dyn_cast<mlir::MemRefType>(memref.getType());
+        if (!memrefTy || memrefTy.getRank() != static_cast<int>(loops.size())) {
+          reason = "corner store rank mismatch";
+          return false;
+        }
+        auto arg = llvm::dyn_cast<mlir::BlockArgument>(memref);
+        if (!arg || arg.getOwner() != &func.getBody().front()) {
+          reason = "corner store memref not block argument";
+          return false;
+        }
+        if (store.getIndices().size() != loops.size()) {
+          reason = "corner store indices mismatch";
+          return false;
+        }
+        for (size_t i = 0; i < loops.size(); ++i) {
+          if (store.getIndices()[i] != loops[i].getInductionVar()) {
+            reason = "corner store indices not ivs";
+            return false;
+          }
+        }
+
+        CornerStoreInfo info;
+        info.outArgIndex = arg.getArgNumber();
+        info.indices = cornerIdx;
+
+        int64_t constVal = 0;
+        if (matchConstantIntValue(store.getValue(), constVal)) {
+          info.isConst = true;
+          info.constValue = constVal;
+        } else {
+          auto it = loads.find(store.getValue());
+          if (it == loads.end()) {
+            reason = "corner store not const or load";
+            return false;
+          }
+          auto load = it->second;
+          auto inMemref = stripMemrefCasts(load.getMemref());
+          auto inArg = llvm::dyn_cast<mlir::BlockArgument>(inMemref);
+          if (!inArg || inArg.getOwner() != &func.getBody().front()) {
+            reason = "corner load memref not block argument";
+            return false;
+          }
+          info.inArgIndex = inArg.getArgNumber();
+        }
+
+        stores.push_back(std::move(info));
+        sawStore = true;
+        continue;
+      }
+      if (llvm::isa<mlir::memref::CastOp>(op) || isConstLikeOp(&op)) {
+        continue;
+      }
+      reason = "unsupported op in corner loop body";
+      return false;
+    }
+    if (!sawStore) {
+      reason = "no store in corner loop";
+      return false;
+    }
+    return true;
+  }
 }
 
 static bool collectCopyPairsFromLoopNest(
@@ -714,7 +906,7 @@ static bool isWithinResidualLoop(
 static void analyzeResidualCopyBoundary(
     mlir::func::FuncOp func, mlir::Neptune::NeptuneIR::ApplyOp apply,
     ApplyStencilInfo &info) {
-  // Residual SCF is only accepted when it is pure copy-boundary.
+  // Residual SCF is only accepted when it is copy-boundary or corner-only.
   llvm::SmallVector<mlir::scf::ForOp, 4> residualLoops;
   bool sawResidual = false;
   bool ok = true;
@@ -739,14 +931,24 @@ static void analyzeResidualCopyBoundary(
   });
 
   llvm::SmallVector<CopyPairInfo, 4> pairs;
+  llvm::SmallVector<CornerStoreInfo, 4> corners;
   for (auto loop : residualLoops) {
     sawResidual = true;
     std::string loopReason;
-    if (!collectCopyPairsFromLoopNest(loop, pairs, loopReason)) {
-      ok = false;
-      if (reason.empty())
-        reason = loopReason;
-      break;
+    if (loopHasCornerStore(loop)) {
+      if (!collectCornerStoresFromLoopNest(loop, corners, loopReason)) {
+        ok = false;
+        if (reason.empty())
+          reason = loopReason;
+        break;
+      }
+    } else {
+      if (!collectCopyPairsFromLoopNest(loop, pairs, loopReason)) {
+        ok = false;
+        if (reason.empty())
+          reason = loopReason;
+        break;
+      }
     }
   }
 
@@ -789,9 +991,10 @@ static void analyzeResidualCopyBoundary(
     info.residualCopyBoundary = false;
     return;
   }
-  if (ok && !pairs.empty()) {
-    info.residualCopyBoundary = true;
+  if (ok && (!pairs.empty() || !corners.empty())) {
+    info.residualCopyBoundary = !pairs.empty();
     info.copyPairs = std::move(pairs);
+    info.cornerStores = std::move(corners);
     return;
   }
   info.residualCopyBoundary = false;
@@ -1080,6 +1283,9 @@ static const PortInfo *pickShapePort(const KernelInfo &info) {
 }
 
 static bool strategyAllowsOverlap(const KernelInfo &info) {
+  if (info.hasResidualScf) {
+    return false;
+  }
   return info.strategy.valid && info.strategy.mode == "overlap_split";
 }
 
@@ -1238,8 +1444,10 @@ static bool collectKernelInfos(const EventDB &db,
       bool boundsFromApply = false;
       bool applyHasResidualScf = false;
       bool applyResidualCopy = false;
+      bool applyResidualCorner = false;
       std::string residualReason;
       llvm::SmallVector<CopyPairInfo, 4> residualPairs;
+      llvm::SmallVector<CornerStoreInfo, 4> residualCorners;
       llvm::SmallVector<int64_t, 4> radius;
       std::string radiusSource;
 
@@ -1248,6 +1456,8 @@ static bool collectKernelInfos(const EventDB &db,
         applyResidualCopy = applyInfo->residualCopyBoundary;
         residualReason = applyInfo->residualReason;
         residualPairs = applyInfo->copyPairs;
+        residualCorners = applyInfo->cornerStores;
+        applyResidualCorner = !residualCorners.empty();
         if (applyInfo->lb.size() == outPort->rank &&
             applyInfo->ub.size() == outPort->rank) {
           bool ok = true;
@@ -1294,8 +1504,8 @@ static bool collectKernelInfos(const EventDB &db,
                          << tag << "'\n";
           }
           if (boundsFromApply && applyHasResidualScf) {
+            bool ok = true;
             if (applyResidualCopy && !residualPairs.empty()) {
-              bool ok = true;
               for (const auto &pair : residualPairs) {
                 const PortInfo *pairIn =
                     findPortByArgIndex(info, pair.inArgIndex);
@@ -1318,7 +1528,8 @@ static bool collectKernelInfos(const EventDB &db,
                 }
                 if (pairIn->rank > 3 && boundaryCopyMode != "whole") {
                   ok = false;
-                  residualReason = "rank>3 requires NEPTUNECC_BOUNDARY_COPY_MODE=whole";
+                  residualReason =
+                      "rank>3 requires NEPTUNECC_BOUNDARY_COPY_MODE=whole";
                   break;
                 }
                 if (pairIn->shape != pairOut->shape) {
@@ -1337,21 +1548,70 @@ static bool collectKernelInfos(const EventDB &db,
                 info.partialCopyBoundary = true;
                 info.copyPairs = std::move(residualPairs);
                 info.boundaryCopyMode = boundaryCopyMode;
-              } else {
-                info.boundsValid = false;
-                info.partialCopyBoundary = false;
-                info.residualReason =
-                    residualReason.empty()
-                        ? "residual scf not copy-boundary"
-                        : residualReason;
-                logKernelSummary(info, *inPort, llvm::outs());
-                logResidualDecision(info, llvm::outs());
               }
-            } else {
+            }
+
+            if (ok && applyResidualCorner) {
+              for (const auto &corner : residualCorners) {
+                const PortInfo *outPortCorner =
+                    findPortByArgIndex(info, corner.outArgIndex);
+                if (!outPortCorner) {
+                  ok = false;
+                  residualReason = "corner out not in port_map";
+                  break;
+                }
+                if (corner.indices.size() != outPortCorner->rank) {
+                  ok = false;
+                  residualReason = "corner index rank mismatch";
+                  break;
+                }
+                bool inBounds = true;
+                for (size_t d = 0; d < corner.indices.size(); ++d) {
+                  if (corner.indices[d] < 0 ||
+                      corner.indices[d] >= outPortCorner->shape[d]) {
+                    inBounds = false;
+                    break;
+                  }
+                }
+                if (!inBounds) {
+                  ok = false;
+                  residualReason = "corner index out of bounds";
+                  break;
+                }
+                if (corner.inArgIndex) {
+                  const PortInfo *inPortCorner =
+                      findPortByArgIndex(info, *corner.inArgIndex);
+                  if (!inPortCorner) {
+                    ok = false;
+                    residualReason = "corner input not in port_map";
+                    break;
+                  }
+                  if (inPortCorner->rank != outPortCorner->rank ||
+                      inPortCorner->shape != outPortCorner->shape) {
+                    ok = false;
+                    residualReason = "corner input shape mismatch";
+                    break;
+                  }
+                }
+              }
+              if (ok) {
+                info.cornerStores = std::move(residualCorners);
+              }
+            }
+
+            if (!applyResidualCopy && !applyResidualCorner) {
+              ok = false;
+              if (residualReason.empty())
+                residualReason = "residual scf not copy-boundary/corner";
+            }
+
+            if (!ok) {
               info.boundsValid = false;
+              info.partialCopyBoundary = false;
               info.residualReason =
-                  residualReason.empty() ? "residual scf not copy-boundary"
-                                         : residualReason;
+                  residualReason.empty()
+                      ? "residual scf not copy-boundary/corner"
+                      : residualReason;
               logKernelSummary(info, *inPort, llvm::outs());
               logResidualDecision(info, llvm::outs());
             }
@@ -1517,30 +1777,39 @@ static void logResidualDecision(const KernelInfo &info,
                                 llvm::raw_ostream &os) {
   if (info.hasResidualScf) {
     os << "neptune-cc:   residual_scf=yes";
-    if (info.partialCopyBoundary) {
-      os << " copy_boundary=yes decision=PartialRewrite";
+    bool hasCorner = !info.cornerStores.empty();
+    if (info.partialCopyBoundary || hasCorner) {
+      os << " decision=PartialRewrite";
+      os << " copy_boundary=" << (info.partialCopyBoundary ? "yes" : "no");
+      os << " corner=" << (hasCorner ? "yes" : "no");
       if (!info.boundaryCopyMode.empty()) {
         os << " mode=" << info.boundaryCopyMode;
       }
       os << "\n";
-      os << "neptune-cc:   copy_pairs=" << info.copyPairs.size() << " [";
-      for (size_t i = 0; i < info.copyPairs.size(); ++i) {
-        const auto &pair = info.copyPairs[i];
-        const PortInfo *inPortPair = findPortByArgIndex(info, pair.inArgIndex);
-        const PortInfo *outPortPair =
-            findPortByArgIndex(info, pair.outArgIndex);
-        if (i > 0) {
-          os << ", ";
+      if (info.partialCopyBoundary) {
+        os << "neptune-cc:   copy_pairs=" << info.copyPairs.size() << " [";
+        for (size_t i = 0; i < info.copyPairs.size(); ++i) {
+          const auto &pair = info.copyPairs[i];
+          const PortInfo *inPortPair =
+              findPortByArgIndex(info, pair.inArgIndex);
+          const PortInfo *outPortPair =
+              findPortByArgIndex(info, pair.outArgIndex);
+          if (i > 0) {
+            os << ", ";
+          }
+          os << "arg" << pair.inArgIndex << "->arg" << pair.outArgIndex;
+          if (inPortPair && outPortPair) {
+            os << "(" << inPortPair->name << "->" << outPortPair->name << ")";
+          }
+          if (!pair.fullDomain) {
+            os << ":partial";
+          }
         }
-        os << "arg" << pair.inArgIndex << "->arg" << pair.outArgIndex;
-        if (inPortPair && outPortPair) {
-          os << "(" << inPortPair->name << "->" << outPortPair->name << ")";
-        }
-        if (!pair.fullDomain) {
-          os << ":partial";
-        }
+        os << "]\n";
       }
-      os << "]\n";
+      if (hasCorner) {
+        os << "neptune-cc:   corner_ops=" << info.cornerStores.size() << "\n";
+      }
     } else {
       os << " copy_boundary=no decision=SkipRewrite";
       if (!info.residualReason.empty()) {
@@ -2138,6 +2407,55 @@ static void emitSlabCopy3D(CodeWriter &w, const std::string &inName,
   w.line();
 }
 
+static bool computeRowMajorOffset(llvm::ArrayRef<int64_t> shape,
+                                  llvm::ArrayRef<int64_t> indices,
+                                  int64_t &offset) {
+  if (shape.size() != indices.size()) {
+    return false;
+  }
+  int64_t stride = 1;
+  offset = 0;
+  for (size_t i = shape.size(); i-- > 0;) {
+    if (indices[i] < 0 || indices[i] >= shape[i]) {
+      return false;
+    }
+    offset += indices[i] * stride;
+    stride *= shape[i];
+  }
+  return true;
+}
+
+static void emitCornerStores(CodeWriter &w, const KernelInfo &kernel) {
+  w.line("// corner stores");
+  for (const auto &corner : kernel.cornerStores) {
+    const PortInfo *outPort = findPortByArgIndex(kernel, corner.outArgIndex);
+    if (!outPort) {
+      continue;
+    }
+    int64_t offset = 0;
+    if (!computeRowMajorOffset(outPort->shape, corner.indices, offset)) {
+      continue;
+    }
+    if (corner.isConst) {
+      w.line(llvm::formatv("{0}[{1}] = static_cast<int32_t>({2});",
+                           outPort->name, offset, corner.constValue)
+                 .str());
+      continue;
+    }
+    if (corner.inArgIndex) {
+      const PortInfo *inPort =
+          findPortByArgIndex(kernel, *corner.inArgIndex);
+      if (!inPort) {
+        continue;
+      }
+      w.line(llvm::formatv("{0}[{1}] = {2}[{1}];", outPort->name, offset,
+                           inPort->name)
+                 .str());
+    }
+  }
+  w.line();
+}
+
 struct DimSpec {
   int64_t min = 0;
   int64_t extent = 0;
@@ -2445,9 +2763,9 @@ static bool writeGlueCpp(llvm::StringRef glueDir,
       }
     }
 
-    std::string call;
-    llvm::raw_string_ostream callStream(call);
-    callStream << "return ::" << kernel.tag << "(";
+    std::string callExpr;
+    llvm::raw_string_ostream callStream(callExpr);
+    callStream << "::" << kernel.tag << "(";
     bool firstArg = true;
     for (unsigned arg : kernel.halideArgs) {
       const PortInfo *port = findPortByArgIndex(kernel, arg);
@@ -2460,8 +2778,17 @@ static bool writeGlueCpp(llvm::StringRef glueDir,
       const char *prefix = port->isInput ? "in" : "out";
       callStream << "&" << prefix << port->roleIndex << "_buf";
     }
-    callStream << ");";
-    w.line(callStream.str());
+    callStream << ")";
+    bool hasCorner = !kernel.cornerStores.empty();
+    if (hasCorner) {
+      w.line(llvm::formatv("int rc = {0};", callStream.str()).str());
+    } else {
+      w.line(llvm::formatv("return {0};", callStream.str()).str());
+    }
+    if (hasCorner) {
+      emitCornerStores(w, kernel);
+      w.line("return rc;");
+    }
     w.dedent();
     w.line("}");
     w.line();
@@ -2487,7 +2814,7 @@ static bool writeGlueCpp(llvm::StringRef glueDir,
                              prefix, port->roleIndex, port->name)
                    .str());
       }
-      w.line(callStream.str());
+      w.line(llvm::formatv("return {0};", callStream.str()).str());
       w.dedent();
       w.line("}");
       w.line();
@@ -2513,7 +2840,7 @@ static bool writeGlueCpp(llvm::StringRef glueDir,
                                prefix, port->roleIndex, port->name)
                      .str());
         }
-        w.line(callStream.str());
+        w.line(llvm::formatv("return {0};", callStream.str()).str());
         w.dedent();
         w.line("}");
         w.line();
@@ -2715,13 +3042,16 @@ bool rewriteKernelSources(const EventDB &db, llvm::StringRef outDir) {
     } else if (!kernel.boundsValid) {
       decision.mode = "SkipRewrite";
       decision.reason = "no valid stencil bounds";
-    } else if (kernel.hasResidualScf && !kernel.partialCopyBoundary) {
+    } else if (kernel.hasResidualScf && !kernel.partialCopyBoundary &&
+               kernel.cornerStores.empty()) {
       decision.mode = "SkipRewrite";
       decision.reason =
           kernel.residualReason.empty()
-              ? "residual_scf_not_copy_boundary"
-              : ("residual_scf_not_copy_boundary: " + kernel.residualReason);
-    } else if (kernel.hasResidualScf && kernel.partialCopyBoundary) {
+              ? "residual_scf_not_copy_boundary_or_corner"
+              : ("residual_scf_not_copy_boundary_or_corner: " +
+                 kernel.residualReason);
+    } else if (kernel.hasResidualScf &&
+               (kernel.partialCopyBoundary || !kernel.cornerStores.empty())) {
       decision.mode = "PartialRewrite";
       decision.boundaryCopyMode = kernel.boundaryCopyMode;
     } else {

@@ -6,6 +6,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
@@ -765,6 +766,119 @@ static bool collectBoundaryConds(Value cond, Value ivI, Value ivJ, int64_t lbI,
   return false;
 }
 
+static bool parseCornerCmp2D(arith::CmpIOp cmp, Value ivI, Value ivJ,
+                             int64_t lbI, int64_t ubI, int64_t lbJ,
+                             int64_t ubJ, int &dimOut, bool &isMin,
+                             std::string &reason) {
+  // Decode "iv == lb|ub-1" for a single dimension.
+  Value lhs = cmp.getLhs();
+  Value rhs = cmp.getRhs();
+  arith::CmpIPredicate pred = cmp.getPredicate();
+  int64_t cst = 0;
+
+  if (lhs == ivI) {
+    if (!evalIndexExpr(rhs, cst)) {
+      reason = "corner cmp rhs not constant";
+      return false;
+    }
+    dimOut = 0;
+  } else if (lhs == ivJ) {
+    if (!evalIndexExpr(rhs, cst)) {
+      reason = "corner cmp rhs not constant";
+      return false;
+    }
+    dimOut = 1;
+  } else if (rhs == ivI) {
+    if (!evalIndexExpr(lhs, cst)) {
+      reason = "corner cmp lhs not constant";
+      return false;
+    }
+    dimOut = 0;
+    pred = swapPredicate(pred);
+  } else if (rhs == ivJ) {
+    if (!evalIndexExpr(lhs, cst)) {
+      reason = "corner cmp lhs not constant";
+      return false;
+    }
+    dimOut = 1;
+    pred = swapPredicate(pred);
+  } else {
+    reason = "corner cmp not against iv";
+    return false;
+  }
+
+  if (pred != arith::CmpIPredicate::eq) {
+    reason = "corner cmp not eq";
+    return false;
+  }
+
+  int64_t lb = (dimOut == 0) ? lbI : lbJ;
+  int64_t ub = (dimOut == 0) ? ubI : ubJ;
+  if (cst == lb) {
+    isMin = true;
+    return true;
+  }
+  if (cst == ub - 1) {
+    isMin = false;
+    return true;
+  }
+  reason = "corner cmp not at boundary";
+  return false;
+}
+
+static bool collectCornerConds2D(Value cond, Value ivI, Value ivJ, int64_t lbI,
+                                 int64_t ubI, int64_t lbJ, int64_t ubJ,
+                                 bool &seenI, bool &iAtMin, bool &seenJ,
+                                 bool &jAtMin, std::string &reason) {
+  Operation *def = cond.getDefiningOp();
+  if (!def) {
+    reason = "corner condition not defined by op";
+    return false;
+  }
+
+  if (auto andOp = dyn_cast<arith::AndIOp>(def)) {
+    if (!collectCornerConds2D(andOp.getLhs(), ivI, ivJ, lbI, ubI, lbJ, ubJ,
+                              seenI, iAtMin, seenJ, jAtMin, reason))
+      return false;
+    if (!collectCornerConds2D(andOp.getRhs(), ivI, ivJ, lbI, ubI, lbJ, ubJ,
+                              seenI, iAtMin, seenJ, jAtMin, reason))
+      return false;
+    return true;
+  }
+
+  if (isa<arith::OrIOp>(def)) {
+    reason = "corner condition with or not supported";
+    return false;
+  }
+
+  if (auto cmp = dyn_cast<arith::CmpIOp>(def)) {
+    int dim = -1;
+    bool isMin = false;
+    if (!parseCornerCmp2D(cmp, ivI, ivJ, lbI, ubI, lbJ, ubJ, dim, isMin,
+                          reason))
+      return false;
+    if (dim == 0) {
+      if (seenI && iAtMin != isMin) {
+        reason = "corner dim0 conflict";
+        return false;
+      }
+      seenI = true;
+      iAtMin = isMin;
+    } else if (dim == 1) {
+      if (seenJ && jAtMin != isMin) {
+        reason = "corner dim1 conflict";
+        return false;
+      }
+      seenJ = true;
+      jAtMin = isMin;
+    }
+    return true;
+  }
+
+  reason = "unsupported corner condition op";
+  return false;
+}
+
 static bool collectBoundaryConds3D(Value cond, Value ivI, Value ivJ,
                                    Value ivK, int64_t lbI, int64_t ubI,
                                    int64_t lbJ, int64_t ubJ, int64_t lbK,
@@ -817,6 +931,153 @@ static bool collectBoundaryConds3D(Value cond, Value ivI, Value ivJ,
   }
 
   reason = "unsupported condition op";
+  return false;
+}
+
+static bool parseCornerCmp3D(arith::CmpIOp cmp, Value ivI, Value ivJ,
+                             Value ivK, int64_t lbI, int64_t ubI, int64_t lbJ,
+                             int64_t ubJ, int64_t lbK, int64_t ubK,
+                             int &dimOut, bool &isMin, std::string &reason) {
+  Value lhs = cmp.getLhs();
+  Value rhs = cmp.getRhs();
+  arith::CmpIPredicate pred = cmp.getPredicate();
+  int64_t cst = 0;
+
+  if (lhs == ivI) {
+    if (!evalIndexExpr(rhs, cst)) {
+      reason = "corner cmp rhs not constant";
+      return false;
+    }
+    dimOut = 0;
+  } else if (lhs == ivJ) {
+    if (!evalIndexExpr(rhs, cst)) {
+      reason = "corner cmp rhs not constant";
+      return false;
+    }
+    dimOut = 1;
+  } else if (lhs == ivK) {
+    if (!evalIndexExpr(rhs, cst)) {
+      reason = "corner cmp rhs not constant";
+      return false;
+    }
+    dimOut = 2;
+  } else if (rhs == ivI) {
+    if (!evalIndexExpr(lhs, cst)) {
+      reason = "corner cmp lhs not constant";
+      return false;
+    }
+    dimOut = 0;
+    pred = swapPredicate(pred);
+  } else if (rhs == ivJ) {
+    if (!evalIndexExpr(lhs, cst)) {
+      reason = "corner cmp lhs not constant";
+      return false;
+    }
+    dimOut = 1;
+    pred = swapPredicate(pred);
+  } else if (rhs == ivK) {
+    if (!evalIndexExpr(lhs, cst)) {
+      reason = "corner cmp lhs not constant";
+      return false;
+    }
+    dimOut = 2;
+    pred = swapPredicate(pred);
+  } else {
+    reason = "corner cmp not against iv";
+    return false;
+  }
+
+  if (pred != arith::CmpIPredicate::eq) {
+    reason = "corner cmp not eq";
+    return false;
+  }
+
+  int64_t lb = 0;
+  int64_t ub = 0;
+  if (dimOut == 0) {
+    lb = lbI;
+    ub = ubI;
+  } else if (dimOut == 1) {
+    lb = lbJ;
+    ub = ubJ;
+  } else {
+    lb = lbK;
+    ub = ubK;
+  }
+
+  if (cst == lb) {
+    isMin = true;
+    return true;
+  }
+  if (cst == ub - 1) {
+    isMin = false;
+    return true;
+  }
+  reason = "corner cmp not at boundary";
+  return false;
+}
+
+static bool collectCornerConds3D(Value cond, Value ivI, Value ivJ, Value ivK,
+                                 int64_t lbI, int64_t ubI, int64_t lbJ,
+                                 int64_t ubJ, int64_t lbK, int64_t ubK,
+                                 bool &seenI, bool &iAtMin, bool &seenJ,
+                                 bool &jAtMin, bool &seenK, bool &kAtMin,
+                                 std::string &reason) {
+  Operation *def = cond.getDefiningOp();
+  if (!def) {
+    reason = "corner condition not defined by op";
+    return false;
+  }
+
+  if (auto andOp = dyn_cast<arith::AndIOp>(def)) {
+    if (!collectCornerConds3D(andOp.getLhs(), ivI, ivJ, ivK, lbI, ubI, lbJ,
+                              ubJ, lbK, ubK, seenI, iAtMin, seenJ, jAtMin,
+                              seenK, kAtMin, reason))
+      return false;
+    if (!collectCornerConds3D(andOp.getRhs(), ivI, ivJ, ivK, lbI, ubI, lbJ,
+                              ubJ, lbK, ubK, seenI, iAtMin, seenJ, jAtMin,
+                              seenK, kAtMin, reason))
+      return false;
+    return true;
+  }
+
+  if (isa<arith::OrIOp>(def)) {
+    reason = "corner condition with or not supported";
+    return false;
+  }
+
+  if (auto cmp = dyn_cast<arith::CmpIOp>(def)) {
+    int dim = -1;
+    bool isMin = false;
+    if (!parseCornerCmp3D(cmp, ivI, ivJ, ivK, lbI, ubI, lbJ, ubJ, lbK, ubK,
+                          dim, isMin, reason))
+      return false;
+    if (dim == 0) {
+      if (seenI && iAtMin != isMin) {
+        reason = "corner dim0 conflict";
+        return false;
+      }
+      seenI = true;
+      iAtMin = isMin;
+    } else if (dim == 1) {
+      if (seenJ && jAtMin != isMin) {
+        reason = "corner dim1 conflict";
+        return false;
+      }
+      seenJ = true;
+      jAtMin = isMin;
+    } else if (dim == 2) {
+      if (seenK && kAtMin != isMin) {
+        reason = "corner dim2 conflict";
+        return false;
+      }
+      seenK = true;
+      kAtMin = isMin;
+    }
+    return true;
+  }
+
+  reason = "unsupported corner condition op";
   return false;
 }
 
@@ -940,6 +1201,85 @@ static bool collectBoundaryConds1D(Value cond, Value ivI, int64_t lbI,
   return false;
 }
 
+[[maybe_unused]] static bool parseCornerCmp1D(arith::CmpIOp cmp, Value ivI,
+                                              int64_t lbI, int64_t ubI,
+                                              bool &isMin,
+                                              std::string &reason) {
+  Value lhs = cmp.getLhs();
+  Value rhs = cmp.getRhs();
+  arith::CmpIPredicate pred = cmp.getPredicate();
+  int64_t cst = 0;
+
+  if (lhs == ivI) {
+    if (!evalIndexExpr(rhs, cst)) {
+      reason = "corner cmp rhs not constant";
+      return false;
+    }
+  } else if (rhs == ivI) {
+    if (!evalIndexExpr(lhs, cst)) {
+      reason = "corner cmp lhs not constant";
+      return false;
+    }
+    pred = swapPredicate(pred);
+  } else {
+    reason = "corner cmp not against iv";
+    return false;
+  }
+
+  if (pred != arith::CmpIPredicate::eq) {
+    reason = "corner cmp not eq";
+    return false;
+  }
+  if (cst == lbI) {
+    isMin = true;
+    return true;
+  }
+  if (cst == ubI - 1) {
+    isMin = false;
+    return true;
+  }
+  reason = "corner cmp not at boundary";
+  return false;
+}
+
+[[maybe_unused]] static bool collectCornerConds1D(Value cond, Value ivI,
+                                                  int64_t lbI, int64_t ubI,
+                                                  bool &seenI, bool &iAtMin,
+                                                  std::string &reason) {
+  Operation *def = cond.getDefiningOp();
+  if (!def) {
+    reason = "corner condition not defined by op";
+    return false;
+  }
+  if (auto andOp = dyn_cast<arith::AndIOp>(def)) {
+    if (!collectCornerConds1D(andOp.getLhs(), ivI, lbI, ubI, seenI, iAtMin,
+                              reason))
+      return false;
+    if (!collectCornerConds1D(andOp.getRhs(), ivI, lbI, ubI, seenI, iAtMin,
+                              reason))
+      return false;
+    return true;
+  }
+  if (isa<arith::OrIOp>(def)) {
+    reason = "corner condition with or not supported";
+    return false;
+  }
+  if (auto cmp = dyn_cast<arith::CmpIOp>(def)) {
+    bool isMin = false;
+    if (!parseCornerCmp1D(cmp, ivI, lbI, ubI, isMin, reason))
+      return false;
+    if (seenI && iAtMin != isMin) {
+      reason = "corner dim0 conflict";
+      return false;
+    }
+    seenI = true;
+    iAtMin = isMin;
+    return true;
+  }
+  reason = "unsupported corner condition op";
+  return false;
+}
+
 // Forward declaration for region cloning helper.
 static void cloneRegionOps(Region &src, OpBuilder &b, IRMapping &mapping);
 
@@ -1046,6 +1386,87 @@ static bool collectCondOps(Value cond, Block &block,
       continue;
     }
     if (!collectCondOps(operand, block, condOps, reason)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static bool checkCornerBranchOps(Region &region, std::string &reason) {
+  // Corner branches must be straight-line: no nested if/for.
+  for (Block &block : region) {
+    for (Operation &op : block) {
+      if (op.hasTrait<OpTrait::IsTerminator>())
+        continue;
+      if (isa<scf::ForOp>(op)) {
+        reason = "corner branch contains nested loop";
+        return false;
+      }
+      if (isa<scf::IfOp>(op)) {
+        reason = "corner branch contains nested if";
+        return false;
+      }
+      if (isa<memref::LoadOp>(op) || isa<memref::StoreOp>(op) ||
+          isa<memref::CastOp>(op) || isa<arith::ConstantOp>(op) ||
+          isa<arith::ConstantIndexOp>(op) || isa<arith::AddIOp>(op) ||
+          isa<arith::SubIOp>(op) || isa<arith::MulIOp>(op) ||
+          isa<arith::DivSIOp>(op) || isa<arith::DivUIOp>(op) ||
+          isa<arith::IndexCastOp>(op) || isa<arith::CmpIOp>(op) ||
+          isa<arith::SelectOp>(op) || isa<arith::AndIOp>(op) ||
+          isa<arith::OrIOp>(op) || isa<arith::XOrIOp>(op)) {
+        continue;
+      }
+      if (auto iface = dyn_cast<MemoryEffectOpInterface>(op)) {
+        if (!iface.hasNoEffect()) {
+          reason = "corner branch side-effect op";
+          return false;
+        }
+        continue;
+      }
+      reason = "corner branch unsupported op";
+      return false;
+    }
+  }
+  return true;
+}
+
+static void tagCornerStores(Operation *op) {
+  auto *ctx = op->getContext();
+  auto attr = UnitAttr::get(ctx);
+  op->walk([&](memref::StoreOp store) { store->setAttr("neptune.corner", attr); });
+}
+
+static bool findNestedBoundaryIf(scf::IfOp outerIf, scf::IfOp &nested,
+                                 std::string &reason) {
+  Block &elseBlock = outerIf.getElseRegion().front();
+  for (Operation &op : elseBlock.without_terminator()) {
+    if (auto candidate = dyn_cast<scf::IfOp>(op)) {
+      if (nested) {
+        reason = "multiple ifs in corner else";
+        return false;
+      }
+      nested = candidate;
+    }
+  }
+  if (!nested) {
+    reason = "missing boundary if in corner else";
+    return false;
+  }
+  if (nested.getNumResults() != 0 || !nested.getThenRegion().hasOneBlock() ||
+      !nested.getElseRegion().hasOneBlock()) {
+    reason = "nested boundary if malformed";
+    return false;
+  }
+
+  llvm::DenseSet<Operation *> condOps;
+  if (!collectCondOps(nested.getCondition(), elseBlock, condOps, reason)) {
+    return false;
+  }
+  for (Operation &op : elseBlock.without_terminator()) {
+    if (&op == nested.getOperation())
+      continue;
+    if (!condOps.contains(&op)) {
+      reason = "extra ops in corner else";
       return false;
     }
   }
@@ -1249,12 +1670,46 @@ static bool tryPeel3D(func::FuncOp func, SummaryInfo &summary) {
       continue;
     }
 
+    scf::IfOp boundaryIf = ifOp;
+    bool hasCorner = false;
+    int64_t cornerI = 0;
+    int64_t cornerJ = 0;
+    int64_t cornerK = 0;
+    {
+      bool seenCornerI = false;
+      bool seenCornerJ = false;
+      bool seenCornerK = false;
+      bool cornerIAtMin = false;
+      bool cornerJAtMin = false;
+      bool cornerKAtMin = false;
+      std::string cornerReason;
+      if (collectCornerConds3D(ifOp.getCondition(), outer.getInductionVar(),
+                               middle.getInductionVar(),
+                               inner.getInductionVar(), lbI, ubI, lbJ, ubJ,
+                               lbK, ubK, seenCornerI, cornerIAtMin,
+                               seenCornerJ, cornerJAtMin, seenCornerK,
+                               cornerKAtMin, cornerReason) &&
+          seenCornerI && seenCornerJ && seenCornerK) {
+        scf::IfOp nested;
+        if (!findNestedBoundaryIf(ifOp, nested, cornerReason)) {
+          summary.reason = "skip peel: " + cornerReason;
+          continue;
+        }
+        hasCorner = true;
+        boundaryIf = nested;
+        cornerI = cornerIAtMin ? lbI : (ubI - 1);
+        cornerJ = cornerJAtMin ? lbJ : (ubJ - 1);
+        cornerK = cornerKAtMin ? lbK : (ubK - 1);
+      }
+    }
+
     std::string reason;
     int64_t radius = -1;
     bool seenI = false;
     bool seenJ = false;
     bool seenK = false;
-    if (!collectBoundaryConds3D(ifOp.getCondition(), outer.getInductionVar(),
+    if (!collectBoundaryConds3D(boundaryIf.getCondition(),
+                                outer.getInductionVar(),
                                 middle.getInductionVar(),
                                 inner.getInductionVar(), lbI, ubI, lbJ, ubJ,
                                 lbK, ubK, radius, seenI, seenJ, seenK,
@@ -1282,14 +1737,28 @@ static bool tryPeel3D(func::FuncOp func, SummaryInfo &summary) {
       continue;
     }
 
-    if (!checkBranchAccesses3D(ifOp.getElseRegion(),
+    if (hasCorner) {
+      if (!checkCornerBranchOps(ifOp.getThenRegion(), reason)) {
+        summary.reason = "skip peel: " + reason;
+        continue;
+      }
+      if (!checkBranchAccesses3D(ifOp.getThenRegion(),
+                                 outer.getInductionVar(),
+                                 middle.getInductionVar(),
+                                 inner.getInductionVar(), radius, reason)) {
+        summary.reason = "skip peel: " + reason;
+        continue;
+      }
+    }
+
+    if (!checkBranchAccesses3D(boundaryIf.getElseRegion(),
                                outer.getInductionVar(),
                                middle.getInductionVar(),
                                inner.getInductionVar(), radius, reason)) {
       summary.reason = "skip peel: " + reason;
       continue;
     }
-    if (!checkBranchAccesses3D(ifOp.getThenRegion(),
+    if (!checkBranchAccesses3D(boundaryIf.getThenRegion(),
                                outer.getInductionVar(),
                                middle.getInductionVar(),
                                inner.getInductionVar(), radius, reason)) {
@@ -1315,42 +1784,66 @@ static bool tryPeel3D(func::FuncOp func, SummaryInfo &summary) {
     Value lbKPlusR = b.create<arith::ConstantIndexOp>(loc, lbK + radius);
     Value ubKMinusR = b.create<arith::ConstantIndexOp>(loc, ubK - radius);
 
+    if (hasCorner) {
+      Value cornerILb = b.create<arith::ConstantIndexOp>(loc, cornerI);
+      Value cornerIUb =
+          b.create<arith::ConstantIndexOp>(loc, cornerI + 1);
+      Value cornerJLb = b.create<arith::ConstantIndexOp>(loc, cornerJ);
+      Value cornerJUb =
+          b.create<arith::ConstantIndexOp>(loc, cornerJ + 1);
+      Value cornerKLb = b.create<arith::ConstantIndexOp>(loc, cornerK);
+      Value cornerKUb =
+          b.create<arith::ConstantIndexOp>(loc, cornerK + 1);
+      scf::ForOp cornerLoop =
+          buildLoopNestWithBranch3D(
+              b, loc, cornerILb, cornerIUb, cornerJLb, cornerJUb, cornerKLb,
+              cornerKUb, step, ifOp.getThenRegion(),
+              outer.getInductionVar(), middle.getInductionVar(),
+              inner.getInductionVar());
+      tagCornerStores(cornerLoop);
+    }
+
     // Build K faces: full I/J with thin K slabs.
     buildLoopNestWithBranch3D(b, loc, lbIVal, ubIVal, lbJVal, ubJVal, lbKVal,
-                              lbKPlusR, step, ifOp.getThenRegion(),
+                              lbKPlusR, step, boundaryIf.getThenRegion(),
                               outer.getInductionVar(),
                               middle.getInductionVar(),
                               inner.getInductionVar());
     buildLoopNestWithBranch3D(b, loc, lbIVal, ubIVal, lbJVal, ubJVal, ubKMinusR,
-                              ubKVal, step, ifOp.getThenRegion(),
+                              ubKVal, step, boundaryIf.getThenRegion(),
                               outer.getInductionVar(),
                               middle.getInductionVar(),
                               inner.getInductionVar());
     // Build J faces: K interior, thin J slabs.
     buildLoopNestWithBranch3D(b, loc, lbIVal, ubIVal, lbJVal, lbJPlusR,
-                              lbKPlusR, ubKMinusR, step, ifOp.getThenRegion(),
+                              lbKPlusR, ubKMinusR, step,
+                              boundaryIf.getThenRegion(),
                               outer.getInductionVar(),
                               middle.getInductionVar(),
                               inner.getInductionVar());
     buildLoopNestWithBranch3D(b, loc, lbIVal, ubIVal, ubJMinusR, ubJVal,
-                              lbKPlusR, ubKMinusR, step, ifOp.getThenRegion(),
+                              lbKPlusR, ubKMinusR, step,
+                              boundaryIf.getThenRegion(),
                               outer.getInductionVar(),
                               middle.getInductionVar(),
                               inner.getInductionVar());
     // Build I faces: J/K interior, thin I slabs.
     buildLoopNestWithBranch3D(b, loc, lbIVal, lbIPlusR, lbJPlusR, ubJMinusR,
-                              lbKPlusR, ubKMinusR, step, ifOp.getThenRegion(),
+                              lbKPlusR, ubKMinusR, step,
+                              boundaryIf.getThenRegion(),
                               outer.getInductionVar(),
                               middle.getInductionVar(),
                               inner.getInductionVar());
     buildLoopNestWithBranch3D(b, loc, ubIMinusR, ubIVal, lbJPlusR, ubJMinusR,
-                              lbKPlusR, ubKMinusR, step, ifOp.getThenRegion(),
+                              lbKPlusR, ubKMinusR, step,
+                              boundaryIf.getThenRegion(),
                               outer.getInductionVar(),
                               middle.getInductionVar(),
                               inner.getInductionVar());
     // Build interior: no boundary guards, radius peeled away.
     buildLoopNestWithBranch3D(b, loc, lbIPlusR, ubIMinusR, lbJPlusR, ubJMinusR,
-                              lbKPlusR, ubKMinusR, step, ifOp.getElseRegion(),
+                              lbKPlusR, ubKMinusR, step,
+                              boundaryIf.getElseRegion(),
                               outer.getInductionVar(),
                               middle.getInductionVar(),
                               inner.getInductionVar());
@@ -1477,11 +1970,39 @@ static bool tryPeel(func::FuncOp func, SummaryInfo &summary) {
       continue;
     }
 
+    scf::IfOp boundaryIf = ifOp;
+    bool hasCorner = false;
+    int64_t cornerI = 0;
+    int64_t cornerJ = 0;
+    {
+      bool seenCornerI = false;
+      bool seenCornerJ = false;
+      bool cornerIAtMin = false;
+      bool cornerJAtMin = false;
+      std::string cornerReason;
+      if (collectCornerConds2D(ifOp.getCondition(), outer.getInductionVar(),
+                               inner.getInductionVar(), lbI, ubI, lbJ, ubJ,
+                               seenCornerI, cornerIAtMin, seenCornerJ,
+                               cornerJAtMin, cornerReason) &&
+          seenCornerI && seenCornerJ) {
+        scf::IfOp nested;
+        if (!findNestedBoundaryIf(ifOp, nested, cornerReason)) {
+          summary.reason = "skip peel: " + cornerReason;
+          continue;
+        }
+        hasCorner = true;
+        boundaryIf = nested;
+        cornerI = cornerIAtMin ? lbI : (ubI - 1);
+        cornerJ = cornerJAtMin ? lbJ : (ubJ - 1);
+      }
+    }
+
     std::string reason;
     int64_t radius = -1;
     bool seenI = false;
     bool seenJ = false;
-    if (!collectBoundaryConds(ifOp.getCondition(), outer.getInductionVar(),
+    if (!collectBoundaryConds(boundaryIf.getCondition(),
+                              outer.getInductionVar(),
                               inner.getInductionVar(), lbI, ubI, lbJ, ubJ,
                               radius, seenI, seenJ, reason)) {
       summary.reason = "skip peel: " + reason;
@@ -1505,12 +2026,26 @@ static bool tryPeel(func::FuncOp func, SummaryInfo &summary) {
       continue;
     }
 
-    if (!checkBranchAccesses(ifOp.getElseRegion(), outer.getInductionVar(),
+    if (hasCorner) {
+      if (!checkCornerBranchOps(ifOp.getThenRegion(), reason)) {
+        summary.reason = "skip peel: " + reason;
+        continue;
+      }
+      if (!checkBranchAccesses(ifOp.getThenRegion(), outer.getInductionVar(),
+                               inner.getInductionVar(), radius, reason)) {
+        summary.reason = "skip peel: " + reason;
+        continue;
+      }
+    }
+
+    if (!checkBranchAccesses(boundaryIf.getElseRegion(),
+                             outer.getInductionVar(),
                              inner.getInductionVar(), radius, reason)) {
       summary.reason = "skip peel: " + reason;
       continue;
     }
-    if (!checkBranchAccesses(ifOp.getThenRegion(), outer.getInductionVar(),
+    if (!checkBranchAccesses(boundaryIf.getThenRegion(),
+                             outer.getInductionVar(),
                              inner.getInductionVar(), radius, reason)) {
       summary.reason = "skip peel: " + reason;
       continue;
@@ -1530,25 +2065,40 @@ static bool tryPeel(func::FuncOp func, SummaryInfo &summary) {
     Value lbJPlusR = b.create<arith::ConstantIndexOp>(loc, lbJ + radius);
     Value ubJMinusR = b.create<arith::ConstantIndexOp>(loc, ubJ - radius);
 
+    if (hasCorner) {
+      Value cornerILb = b.create<arith::ConstantIndexOp>(loc, cornerI);
+      Value cornerIUb =
+          b.create<arith::ConstantIndexOp>(loc, cornerI + 1);
+      Value cornerJLb = b.create<arith::ConstantIndexOp>(loc, cornerJ);
+      Value cornerJUb =
+          b.create<arith::ConstantIndexOp>(loc, cornerJ + 1);
+      scf::ForOp cornerLoop =
+          buildLoopNestWithBranch(b, loc, cornerILb, cornerIUb, cornerJLb,
+                                  cornerJUb, step, ifOp.getThenRegion(),
+                                  outer.getInductionVar(),
+                                  inner.getInductionVar());
+      tagCornerStores(cornerLoop);
+    }
+
     // Top strip.
     buildLoopNestWithBranch(b, loc, lbIVal, lbIPlusR, lbJVal, ubJVal, step,
-                            ifOp.getThenRegion(), outer.getInductionVar(),
-                            inner.getInductionVar());
+                            boundaryIf.getThenRegion(),
+                            outer.getInductionVar(), inner.getInductionVar());
     // Bottom strip.
     buildLoopNestWithBranch(b, loc, ubIMinusR, ubIVal, lbJVal, ubJVal, step,
-                            ifOp.getThenRegion(), outer.getInductionVar(),
-                            inner.getInductionVar());
+                            boundaryIf.getThenRegion(),
+                            outer.getInductionVar(), inner.getInductionVar());
     // Middle-left strip.
     buildLoopNestWithBranch(b, loc, lbIPlusR, ubIMinusR, lbJVal, lbJPlusR, step,
-                            ifOp.getThenRegion(), outer.getInductionVar(),
-                            inner.getInductionVar());
+                            boundaryIf.getThenRegion(),
+                            outer.getInductionVar(), inner.getInductionVar());
     // Middle-right strip.
     buildLoopNestWithBranch(b, loc, lbIPlusR, ubIMinusR, ubJMinusR, ubJVal, step,
-                            ifOp.getThenRegion(), outer.getInductionVar(),
-                            inner.getInductionVar());
+                            boundaryIf.getThenRegion(),
+                            outer.getInductionVar(), inner.getInductionVar());
     // Interior stencil (no boundary guards).
     buildLoopNestWithBranch(b, loc, lbIPlusR, ubIMinusR, lbJPlusR, ubJMinusR,
-                            step, ifOp.getElseRegion(),
+                            step, boundaryIf.getElseRegion(),
                             outer.getInductionVar(), inner.getInductionVar());
 
     outer.erase();
